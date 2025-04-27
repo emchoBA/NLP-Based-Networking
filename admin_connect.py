@@ -1,16 +1,21 @@
+# admin_connect.py
+
 #!/usr/bin/env python3
 """
 admin_connect.py
 
-Discovers Raspberry Pi devices via UDP broadcast requests,
+Discovers Raspberry Pi devices via UDP broadcast requests,
 accepts TCP connections from them, and periodically
 reports the list of connected device IPs.
+
+Also tracks each connection socket so we can push “policy”
+commands to specific IPs via send_command().
 """
 
 import socket
 import threading
-
 import select
+import time
 
 # -------------------------------------------------------------------
 # Configuration
@@ -18,17 +23,20 @@ import select
 DISCOVERY_PORT     = 9999
 TCP_PORT           = 10000
 DISCOVERY_MSG      = b'DISCOVER_PI'
-BROADCAST_INTERVAL = 5
+BROADCAST_INTERVAL = 5  # seconds
 
 # -------------------------------------------------------------------
-# Control and state
+# State & Locks
 # -------------------------------------------------------------------
-stop_event = threading.Event()
 connected_devices = set()        # set of IP strings
-devices_lock = threading.Lock()
+clients           = {}           # ip_str -> socket
+devices_lock      = threading.Lock()
+clients_lock      = threading.Lock()
+stop_event        = threading.Event()
 
 
 def udp_discovery_sender():
+    """Broadcast discovery + print connected IPs on the same interval."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -36,10 +44,11 @@ def udp_discovery_sender():
     while not stop_event.is_set():
         try:
             sock.sendto(DISCOVERY_MSG, ('<broadcast>', DISCOVERY_PORT))
-            print(f"[UDP] Broadcast discovery to port {DISCOVERY_PORT}")
+            print(f"[UDP] Broadcasted discovery to port {DISCOVERY_PORT}")
         except Exception as e:
             print(f"[UDP] Broadcast error: {e}")
 
+        # Print which IPs are connected right now
         with devices_lock:
             ips = list(connected_devices)
         print(f"[INFO] {len(ips)} device(s) connected: {ips}")
@@ -52,12 +61,22 @@ def udp_discovery_sender():
 
 
 def handle_client(conn: socket.socket, addr):
+    """
+    Each Pi connection runs here:
+     - registers the IP/socket
+     - monitors for disconnect
+     - unregisters on exit
+    """
     ip = addr[0]
+    # Register
     with devices_lock:
         connected_devices.add(ip)
+    with clients_lock:
+        clients[ip] = conn
     print(f"[TCP] New device connected from {ip}")
 
     try:
+        # monitor for clean close
         while not stop_event.is_set():
             rlist, _, _ = select.select([conn], [], [], 1)
             if rlist:
@@ -65,17 +84,21 @@ def handle_client(conn: socket.socket, addr):
                 if not data:
                     print(f"[TCP] Device {ip} disconnected")
                     break
-                # (optional) handle data…
+                # ignoring incoming data for now…
     except Exception as e:
         print(f"[TCP] Error with {ip}: {e}")
     finally:
         conn.close()
+        # Unregister
         with devices_lock:
             connected_devices.discard(ip)
+        with clients_lock:
+            clients.pop(ip, None)
         print(f"[TCP] Handler for {ip} exited")
 
 
 def tcp_server():
+    """Listens for Pi connections and spawns a handler thread each time."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(('', TCP_PORT))
@@ -100,14 +123,29 @@ def tcp_server():
     print("[TCP] Server stopped")
 
 
-def main():
-    # ensure any previous stop flag is cleared
-    stop_event.clear()
+def send_command(ip: str, cmd_str: str):
+    """
+    Send a command string to the Pi at `ip` via its TCP socket.
+    """
+    with clients_lock:
+        sock = clients.get(ip)
+    if not sock:
+        print(f"[ADMIN] No active connection to {ip}")
+        return
 
+    try:
+        payload = cmd_str.encode() + b'\n'
+        sock.sendall(payload)
+        print(f"[ADMIN] Sent to {ip}: {cmd_str}")
+    except Exception as e:
+        print(f"[ADMIN] Error sending to {ip}: {e}")
+
+
+def main():
+    """Starts UDP broadcaster and TCP server threads."""
+    stop_event.clear()
     threading.Thread(target=udp_discovery_sender, daemon=True).start()
     threading.Thread(target=tcp_server, daemon=True).start()
-
     print("admin_connect running. Waiting for stop_event...")
-    # block here until stop_event is set
     stop_event.wait()
     print("admin_connect exiting")

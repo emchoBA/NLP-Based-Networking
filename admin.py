@@ -2,22 +2,24 @@
 """
 admin.py
 
-GUI wrapper around admin_connect.
-Provides Start/Stop controls and an Info menu.
+GUI wrapper around:
+ - admin_connect (start/stop discovery & server)
+ - policy_engine (dispatch NLP rules to Pis)
 """
 
 import threading
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, simpledialog
 
 import admin_connect
+import policy_engine
 
 
 class AdminGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Admin Controller")
-        self.geometry("300x150")
+        self.geometry("300x200")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # ── Menu Bar ─────────────────────────────────────────────
@@ -29,10 +31,14 @@ class AdminGUI(tk.Tk):
 
         # ── Start/Stop Buttons ───────────────────────────────────
         self.start_btn = tk.Button(self, text="Start", width=10, command=self.start)
-        self.start_btn.pack(pady=(30, 5))
+        self.start_btn.pack(pady=(20, 5))
 
         self.stop_btn = tk.Button(self, text="Stop", width=10, command=self.stop, state=tk.DISABLED)
         self.stop_btn.pack(pady=5)
+
+        # ── Test Policy Button ────────────────────────────────────
+        self.policy_btn = tk.Button(self, text="Test Policy", width=10, command=self.test_policy)
+        self.policy_btn.pack(pady=5)
 
         self.worker_thread = None
 
@@ -57,6 +63,20 @@ class AdminGUI(tk.Tk):
         admin_connect.stop_event.set()
         self.stop_btn.config(state=tk.DISABLED)
         self.start_btn.config(state=tk.NORMAL)
+
+    def test_policy(self):
+        """
+        Prompt for a natural-language rule, then parse + dispatch it.
+        """
+        cmd = simpledialog.askstring("Policy Test",
+                                     "Enter policy command(s):",
+                                     parent=self)
+        if not cmd:
+            return
+        try:
+            policy_engine.process_and_dispatch(cmd)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to dispatch:\n{e}")
 
     def on_close(self):
         # ensure threads are told to stop
