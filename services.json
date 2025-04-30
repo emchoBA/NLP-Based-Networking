@@ -1,0 +1,52 @@
+{
+  "ssh": [
+    {"proto": "tcp", "dport": 22}
+  ],
+  "http": [
+    {"proto": "tcp", "dport": 80}
+  ],
+  "https": [
+    {"proto": "tcp", "dport": 443}
+  ],
+  "web": [
+    {"proto": "tcp", "dport": 80},
+    {"proto": "tcp", "dport": 443}
+  ],
+  "dns": [
+    {"proto": "udp", "dport": 53},
+    {"proto": "tcp", "dport": 53}
+  ],
+  "ping": [
+    {"proto": "icmp"}
+  ],
+  "icmp": [
+    {"proto": "icmp"}
+  ],
+  "rdp": [
+    {"proto": "tcp", "dport": 3389}
+  ],
+  "ftp": [
+    {"proto": "tcp", "dport": 21}
+  ],
+  "telnet": [
+    {"proto": "tcp", "dport": 23}
+  ],
+  "smtp": [
+    {"proto": "tcp", "dport": 25}
+  ],
+  "smtps": [
+      {"proto": "tcp", "dport": 465}
+  ],
+  "pop3": [
+      {"proto": "tcp", "dport": 110}
+  ],
+  "pop3s": [
+      {"proto": "tcp", "dport": 995}
+  ],
+  "imap": [
+      {"proto": "tcp", "dport": 143}
+  ],
+  "imaps": [
+      {"proto": "tcp", "dport": 993}
+  ]
+}

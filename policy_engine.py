@@ -2,15 +2,18 @@
 """
 policy_engine.py
 
-Takes a natural-language policy string, parses it via enhanced NLP
-(handling 1 or 2 IPs to determine subject and target device),
-maps verbs to correct iptables targets (ACCEPT/DROP),
-determines direction (INPUT/OUTPUT, -s/-d) based on subject IP's context,
-and pushes commands to the correct TARGET Pi over TCP (via admin_connect).
+Takes a natural-language policy string, parses it via enhanced NLP,
+uses service_mapper to get port/protocol specifics, builds command(s),
+and pushes them to the correct TARGET Pi over TCP (via admin_connect).
 """
 
 from nlp import parse_commands
-import admin_connect
+import admin_connect, service_mapper
+
+# --- START CHANGE 1: Define services to ignore port/proto specifics ---
+# Keep this here as it dictates policy engine behavior
+SERVICES_TO_IGNORE = {"any", "all", "traffic", None}
+# --- END CHANGE 1 ---
 
 # Map the parsed action verbs (lemmas) to actual iptables targets
 ACTION_TO_IPTABLES_TARGET = {
@@ -20,33 +23,30 @@ ACTION_TO_IPTABLES_TARGET = {
 
 def process_and_dispatch(nl_text: str):
     """
-    1) Parse the user’s input using enhanced NLP into potentially complex rules.
-       Rule dict contains: {'action', 'service', 'subject_ip', 'subject_ip_direction', 'target_device_ip'}
-    2) For each rule:
-       a) Validate necessary components are present.
-       b) Map action verb to iptables target (DROP/ACCEPT).
-       c) Determine iptables chain (INPUT/OUTPUT) and IP flag (-s/-d) based on subject_ip_direction.
-       d) Build the command string using subject_ip.
-       e) Send the command to the target_device_ip.
+    Processes natural language, generates potentially multiple iptables
+    commands based on service mappings obtained from service_mapper,
+    and dispatches them.
     """
     print(f"\n[ENGINE] Received text for processing: '{nl_text}'")
-    rules = parse_commands(nl_text) # Use the enhanced parser
+    rules = parse_commands(nl_text)
 
     if not rules:
         print("[ENGINE] No valid commands derived from text.")
         return
 
-    print(f"[ENGINE] Parsed {len(rules)} rule(s). Now dispatching...")
+    print(f"[ENGINE] Parsed {len(rules)} rule(s). Now generating commands...")
 
+    total_commands_sent = 0
     for i, rule in enumerate(rules):
         print(f"\n[ENGINE] Processing Rule {i+1}: {rule}")
 
         action_verb          = rule.get('action')
-        service              = rule.get('service', 'any') # Default service if not parsed
+        service_name         = rule.get('service') # Get the service name
         subject_ip           = rule.get('subject_ip')
         subject_ip_direction = rule.get('subject_ip_direction')
         target_device_ip     = rule.get('target_device_ip')
 
+        # Validate essential components
         if not all([action_verb, subject_ip, target_device_ip]):
             print(f"[ENGINE WARN] Rule {i+1} is incomplete ({rule}). Skipping.")
             continue
@@ -56,72 +56,96 @@ def process_and_dispatch(nl_text: str):
             print(f"[ENGINE WARN] Unknown action verb '{action_verb}' in rule {i+1}. Skipping.")
             continue
 
-        chain = "INPUT"  # Default chain
-        ip_flag = "-s"   # Default flag
-
+        # Determine base chain/flag (same logic as before)
+        chain = "INPUT"; ip_flag = "-s" # Defaults
         if subject_ip_direction == "from":
-            chain = "INPUT"
-            ip_flag = "-s"
-            # print(f"[ENGINE] Rule applies to traffic FROM {subject_ip}")
+            chain = "INPUT"; ip_flag = "-s"
         elif subject_ip_direction == "to":
-            # If rule is "block traffic TO subject_ip", and applied on target_device_ip,
-            # it likely means blocking traffic *destined for* subject_ip arriving *at* target_device_ip.
-            # This implies INPUT chain with destination IP on the target device.
-            # Or, if target_device_ip *is* subject_ip, it means blocking its own OUTPUT.
-            # Let's refine this:
             if target_device_ip == subject_ip:
-                 # Rule applied ON the subject device, concerning traffic TO it? -> OUTPUT
-                 chain = "OUTPUT"
-                 ip_flag = "-d"
-                 print(f"[ENGINE] Interpreting 'to {subject_ip}' on device {target_device_ip} as OUTPUT rule.")
+                 chain = "OUTPUT"; ip_flag = "-d"
             else:
-                 # Rule applied on a DIFFERENT device, concerning traffic TO subject_ip? -> FORWARD or INPUT?
-                 # Let's stick to INPUT -d for now, assuming target is filtering incoming traffic destined elsewhere. Simpler start.
-                 # A more robust system would need FORWARD chain logic.
-                 chain = "INPUT" # Or FORWARD?
-                 ip_flag = "-d" # Traffic destined for subject_ip
-                 print(f"[ENGINE] Interpreting 'to {subject_ip}' on device {target_device_ip} as INPUT -d rule.")
-
+                 chain = "INPUT"; ip_flag = "-d"
         elif subject_ip_direction is None:
-            # No "from" or "to" found for the subject IP. Defaulting to INPUT -s.
-             print(f"[ENGINE WARN] No clear direction ('from'/'to') found for Subject IP {subject_ip}. Defaulting to INPUT chain, source IP (-s).")
-             chain = "INPUT"
-             ip_flag = "-s"
+             print(f"[ENGINE WARN] No clear direction ('from'/'to') for Subject IP {subject_ip}. Defaulting to INPUT -s.")
+             chain = "INPUT"; ip_flag = "-s"
 
-        # (Service mapping still deferred)
-        # Example: iptables -A INPUT -s 192.168.1.2 -j DROP
-        # Example: iptables -A OUTPUT -d 10.0.0.5 -j DROP (if target==subject and direction=="to")
-        cmd = f"iptables -A {chain} {ip_flag} {subject_ip} -j {iptables_target}"
+        # --- START CHANGE 2: Generate command(s) using service_mapper ---
+        commands_to_send = []
+        base_cmd_parts = ["iptables", "-A", chain, ip_flag, subject_ip]
 
-        print(f"[ENGINE] Preparing command '{cmd}'")
-        print(f"[ENGINE] Sending command to TARGET device: {target_device_ip}")
-        admin_connect.send_command(target_device_ip, cmd)
+        # Check if the service should bypass specific mapping lookup
+        if service_name in SERVICES_TO_IGNORE:
+            print(f"[ENGINE] Service '{service_name}' ignores specifics. Applying rule to IP only.")
+            cmd_parts = base_cmd_parts + ["-j", iptables_target]
+            commands_to_send.append(" ".join(cmd_parts))
+        else:
+            # Get parameters from the dedicated mapper module
+            param_list = service_mapper.get_service_params(service_name)
+
+            if param_list: # Mapper returned a list of definitions
+                print(f"[ENGINE] Applying specific rules for service '{service_name}' using {len(param_list)} definition(s).")
+                # Generate a command for each definition in the list
+                for param_dict in param_list:
+                    cmd_parts = list(base_cmd_parts) # Start with a copy
+                    proto = param_dict.get("proto")
+                    dport = param_dict.get("dport")
+
+                    if proto:
+                        cmd_parts.extend(["-p", proto])
+                        # Only add dport if proto is TCP/UDP and dport is present
+                        if proto in ["tcp", "udp"] and dport is not None:
+                             cmd_parts.extend(["--dport", str(dport)])
+                        elif dport is not None:
+                             print(f"[ENGINE WARN] Dport ({dport}) specified for non-TCP/UDP proto '{proto}' in service '{service_name}'. Ignoring dport.")
+
+                    cmd_parts.extend(["-j", iptables_target])
+                    commands_to_send.append(" ".join(cmd_parts))
+
+            else: # Service not found in map, or map unavailable/empty definition
+                 print(f"[ENGINE WARN] Service '{service_name}' not found/defined in mappings or map unavailable. Applying rule to IP only.")
+                 cmd_parts = base_cmd_parts + ["-j", iptables_target]
+                 commands_to_send.append(" ".join(cmd_parts))
+        # --- END CHANGE 2 ---
+
+        # Dispatch the generated commands (same logic as before)
+        if not commands_to_send:
+             print(f"[ENGINE WARN] No commands were generated for rule {i+1}. Check logic.")
+             continue
+
+        print(f"[ENGINE] For Rule {i+1}, generated {len(commands_to_send)} command(s):")
+        for cmd_index, cmd in enumerate(commands_to_send):
+             print(f"  {cmd_index+1}: {cmd}")
+             print(f"[ENGINE] Sending command {cmd_index+1} to TARGET device: {target_device_ip}")
+             admin_connect.send_command(target_device_ip, cmd)
+             total_commands_sent += 1
+
+    print(f"\n[ENGINE] Finished processing. Total commands sent: {total_commands_sent}")
+
 
 if __name__ == "__main__":
-    # Test cases incorporating single and double IP patterns
+    # Simulate connected clients if needed
+    if not admin_connect.clients:
+         print("\n[ENGINE TEST SETUP] Simulating connected clients for testing.")
+         # Use a comprehensive list covering potential targets from tests
+         admin_connect.clients = {ip: object() for ip in [
+             '192.168.1.2', '192.168.1.100', '10.0.0.1', '192.168.1.254',
+             '192.168.1.1', '1.1.1.1', '10.0.0.2', '10.0.0.5', '10.0.0.30',
+             '192.168.5.5', '8.8.8.8'
+         ]}
+
+    # Test cases (same as before)
     test_commands = [
-        "deny internet from 192.168.1.2", # -> Send INPUT -s 192.168.1.2 DROP to 192.168.1.2
-        "allow ssh to 192.168.1.100",    # -> Send OUTPUT -d 192.168.1.100 ACCEPT to 192.168.1.100
-        "on 10.0.0.1 block traffic from 10.0.0.5", # -> Send INPUT -s 10.0.0.5 DROP to 10.0.0.1
-        "at 192.168.1.254 reject telnet from 192.168.5.5", # -> Send INPUT -s 192.168.5.5 DROP to 192.168.1.254
-        "permit ping to 8.8.8.8 on gateway", # Needs 'gateway' mapped to IP
-        "on 192.168.1.1 allow from 192.168.1.50", # -> Send INPUT -s 192.168.1.50 ACCEPT to 192.168.1.1
-        "block 1.1.1.1",                  # -> Send INPUT -s 1.1.1.1 DROP to 1.1.1.1 (default direction)
-        "on 10.0.0.2 permit 10.0.0.30"     # -> Send INPUT -s 10.0.0.30 ACCEPT to 10.0.0.2 (default direction for subject)
+        "deny ssh from 192.168.1.2",
+        "allow dns to 8.8.8.8",
+        "on 10.0.0.1 block http from 10.0.0.5",
+        "permit ping from 192.168.1.100",
+        "block traffic from 1.1.1.1",
+        "reject telnet to 192.168.1.1 on 192.168.1.254",
+        "allow web from 10.0.0.30",
+        "deny ftp traffic from 10.0.0.2",
+        "block unknownservice from 10.0.0.5",
     ]
 
     for cmd_text in test_commands:
-        # Simulate getting connected clients for testing purposes if admin_connect isn't running
-        # In a real run, admin_connect manages the clients dictionary
-        if not admin_connect.clients:
-             print("[ENGINE TEST SETUP] Simulating connected clients for testing.")
-             admin_connect.clients = {
-                 '192.168.1.2': object(), '192.168.1.100': object(),
-                 '10.0.0.1': object(), '192.168.1.254': object(),
-                 '192.168.1.1': object(), '1.1.1.1': object(),
-                 '10.0.0.2': object(), '10.0.0.5': object(), '192.168.5.5': object(),
-                 '10.0.0.30': object()
-             } # Replace object() with mock sockets if needed for send tests
-
         process_and_dispatch(cmd_text)
         print("-" * 20)
