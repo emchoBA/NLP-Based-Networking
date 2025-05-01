@@ -1,3 +1,5 @@
+# --- START OF FILE nlp.py ---
+
 import spacy
 from spacy.matcher import Matcher
 import logging # Use logging
@@ -30,7 +32,7 @@ ACTION_VERBS = {
     "allow", "permit", "accept"
 }
 
-# --- Updated: Define preposition roles ---
+# --- Define preposition roles ---
 TARGET_DEVICE_PREPS = {"on", "at"}
 SOURCE_IP_PREPS = {"from"}
 DESTINATION_IP_PREPS = {"to"}
@@ -41,6 +43,8 @@ BOUNDARY_PREPS = TARGET_DEVICE_PREPS.union(SOURCE_IP_PREPS).union(DESTINATION_IP
 def preprocess(text: str) -> str:
     """Standard preprocessing."""
     text = text.strip().lower()
+    # Basic cleanup - might need refinement
+    text = text.replace(',', ' ')
     return " ".join(text.split())
 
 def parse_single(cmd: str) -> dict:
@@ -59,7 +63,7 @@ def parse_single(cmd: str) -> dict:
      'target_device_ip': str|None} # Target is WHERE the rule is applied
     Returns {} if essential parts are missing.
     """
-    clean = preprocess(cmd)
+    clean = preprocess(cmd) # Use basic preprocessing for single clause
     doc = nlp(clean)
 
     # --- Initialize result dictionary with new structure ---
@@ -103,7 +107,7 @@ def parse_single(cmd: str) -> dict:
             "start_index": start
         })
 
-    log.debug(f"[NLP] Found IP matches: {ip_matches}")
+    log.debug(f"[NLP] Found IP matches in clause '{doc.text}': {ip_matches}")
 
     # --- Assign IP Roles ---
     target_assigned_explicitly = False
@@ -136,7 +140,7 @@ def parse_single(cmd: str) -> dict:
                 log.debug(f"[NLP] Assigned Source IP: {match['ip']} (from '{match['prep']}')")
             else:
                 log.warning(f"[NLP] Multiple 'from' IPs found. Using first: {result['source_ip']}. Ignoring: {match['ip']}")
-                temp_remaining.append(match) # Keep for other roles? Unlikely needed.
+                # Don't keep unmatched 'from' IPs usually
         else:
             temp_remaining.append(match)
     remaining_matches = temp_remaining
@@ -151,25 +155,20 @@ def parse_single(cmd: str) -> dict:
                 log.debug(f"[NLP] Assigned Destination IP: {match['ip']} (from '{match['prep']}')")
             else:
                 log.warning(f"[NLP] Multiple 'to' IPs found. Using first: {result['destination_ip']}. Ignoring: {match['ip']}")
-                temp_remaining.append(match)
+                # Don't keep unmatched 'to' IPs usually
         else:
             temp_remaining.append(match)
     remaining_matches = temp_remaining
 
-    # Priority 4: Unassigned IP (Default to Source if needed)
-    # This logic is now tricky with potentially two IPs (src/dest) being primary
-    # Let's refine: if only one IP overall, and no prep, assign to source?
-    if len(ip_matches) == 1 and not source_assigned and not destination_assigned and not target_assigned_explicitly:
-        # If only one IP found in the entire command and no preposition gave it a role
-        match = ip_matches[0]
-        result["source_ip"] = match["ip"] # Default single IP to source
+    # Priority 4: Unassigned IP (Default single remaining IP to Source)
+    if len(remaining_matches) == 1 and not source_assigned and not destination_assigned:
+        # If only one IP remains *after* checking for target/src/dest preps
+        match = remaining_matches[0]
+        result["source_ip"] = match["ip"]
         source_assigned = True
-        log.debug(f"[NLP] Assigned single IP as Source IP (default): {match['ip']}")
-        # Remove from remaining if it exists (it should be the only one)
-        if remaining_matches and remaining_matches[0]['ip'] == match['ip']:
-            remaining_matches.pop(0)
+        log.debug(f"[NLP] Assigned remaining IP as Source IP (default): {match['ip']}")
+        remaining_matches.pop(0)
 
-    # Check again for remaining unassigned IPs after the default assignment
     if remaining_matches:
          log.warning(f"[NLP] Unassigned IP addresses remaining after parsing: {[m['ip'] for m in remaining_matches]}")
 
@@ -190,8 +189,8 @@ def parse_single(cmd: str) -> dict:
         log.warning("[NLP] Parse failed: No action verb found.")
         return {}
     if not result["target_device_ip"]:
-        # This can happen if only "on X" was specified without from/to IPs
-        log.warning("[NLP] Parse failed: Could not determine Target Device IP (check if IPs are present).")
+        # Can happen if only IPs without preps/actions are present
+        log.warning("[NLP] Parse failed: Could not determine Target Device IP.")
         return {}
     if not result["source_ip"] and not result["destination_ip"]:
         # Need at least one IP for the rule itself
@@ -211,35 +210,43 @@ def parse_commands(text: str) -> list:
     Splits input into sentences, parses each one using parse_single,
     and returns a list of valid dictionaries.
     """
+    # Use basic preprocessing for the whole input text
     clean = preprocess(text)
-    doc   = nlp(clean)
-    out   = []
+    doc = nlp(clean)
+    out = []
     log.debug(f"\n[NLP] Parsing text: '{clean}'")
+
+    # --- Iterate through sentences ---
     for i, sent in enumerate(doc.sents):
         log.debug(f"[NLP] Processing sentence {i+1}: '{sent.text}'")
+        # Parse each sentence independently
         cmd_dict = parse_single(sent.text)
-        if cmd_dict: # Add if non-empty (passed validation)
+        if cmd_dict: # Add if parse_single returned a valid dict
             out.append(cmd_dict)
         else:
             log.warning(f"[NLP] Sentence {i+1} did not yield a valid command structure.")
-    log.debug(f"[NLP] Finished parsing. Found {len(out)} command(s).")
+    # --- End iteration ---
+
+    log.debug(f"[NLP] Finished parsing. Found {len(out)} command(s) total.")
     return out
+
 
 # Example usage
 if __name__ == "__main__":
     logging.getLogger(__name__).setLevel(logging.DEBUG) # Show debug for testing
     tests = [
-        # --- New Tests ---
-        "deny ssh from 192.168.1.12 to 192.168.1.11", # Target: 1.11, Source: 1.12, Dest: 1.11
-        "allow http from 10.0.0.5 to 192.168.1.11",    # Target: 1.11, Source: 10.0.0.5, Dest: 1.11
-        "block dns to 8.8.8.8 from 192.168.1.11",    # Target: 8.8.8.8, Source: 1.11, Dest: 8.8.8.8
-        "on 192.168.1.1 permit tcp from 192.168.1.12 to 192.168.1.11", # Target: 1.1, Source: 1.12, Dest: 1.11
-        "at 192.168.1.254 reject from 10.1.1.1 to 10.2.2.2", # Target: 1.254, Source: 10.1.1.1, Dest: 10.2.2.2
-        # --- Previous Tests (check if still working) ---
-        "Deny all Internet from 192.168.1.2.", # Target: 1.2, Source: 1.2
-        "Allow SSH to 192.168.1.100.", # Target: 1.100, Dest: 1.100
-        "At 192.168.1.254 reject traffic from 192.168.5.5.", # Target: 1.254, Source: 5.5
-        "block 1.1.1.1" # Target: 1.1.1.1, Source: 1.1.1.1
+        # --- Tests ---
+        "deny ssh from 192.168.1.12 to 192.168.1.11",
+        "allow http from 10.0.0.5 to 192.168.1.11",
+        "block dns to 8.8.8.8 from 192.168.1.11",
+        "on 192.168.1.1 permit tcp from 192.168.1.12 to 192.168.1.11",
+        "at 192.168.1.254 reject from 10.1.1.1 to 10.2.2.2",
+        "Deny all Internet from 192.168.1.2.",
+        "Allow SSH to 192.168.1.100.",
+        "At 192.168.1.254 reject traffic from 192.168.5.5.",
+        "block 1.1.1.1",
+        # --- Multi-sentence test ---
+        "on 192.168.1.11 deny 192.168.1.12. allow 192.168.1.15 to 192.168.1.11",
     ]
     all_results = []
     for test in tests:
@@ -249,6 +256,11 @@ if __name__ == "__main__":
         print("--- NLP Test End ---")
 
     print("\n=== Final Parsed NLP Results ===")
-    for i, res in enumerate(all_results):
-        print(f"{i+1}: {res}")
+    if all_results:
+        for i, res in enumerate(all_results):
+            print(f"{i+1}: {res}")
+    else:
+        print("  No rules generated.")
     print("============================")
+
+# --- END OF FILE nlp.py ---
