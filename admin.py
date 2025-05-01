@@ -1,5 +1,3 @@
-# --- START OF FILE admin.py ---
-
 #!/usr/bin/env python3
 """
 admin.py
@@ -51,11 +49,10 @@ try:
     # 2. Apply handler ONLY AFTER checking if it exists
     if log_handler:
          # Add handler to the loggers we want to capture
-         # Use placeholders for backend modules initially
          logging.getLogger("admin_connect").addHandler(log_handler)
          logging.getLogger("policy_engine").addHandler(log_handler)
-         logging.getLogger("service_mapper").addHandler(log_handler) # Add mapper logger
-         logging.getLogger("nlp").addHandler(log_handler) # Add nlp logger
+         logging.getLogger("service_mapper").addHandler(log_handler)
+         logging.getLogger("nlp").addHandler(log_handler)
          # Set minimum level for logs captured by this handler
          logging.getLogger("admin_connect").setLevel(logging.INFO)
          logging.getLogger("policy_engine").setLevel(logging.INFO)
@@ -65,7 +62,7 @@ try:
 except ImportError:
      print("ERROR: PyQt6 is not installed. Please run 'pip install PyQt6'", file=sys.stderr)
 
-     #THIS PART IS FOR THE SOLE PURPOSE OF IGNORING THE WARNINGS
+     #THIS PART IS FOR THE SOLE PURPOSE OF IGNORING THE WARNINGS IN IDE
      QApplication = None
      QMainWindow = None
      QWidget = None
@@ -83,7 +80,7 @@ except ImportError:
      QMessageBox = None
      QTimer = None
      QObject = None
-     pyqtSignal = None
+     pyqtSignal = object # Use object to allow class definition
      Qt = None
      QColor = None
      QFont = None
@@ -103,10 +100,13 @@ try:
 except ImportError as e:
      print(f"ERROR: Failed to import backend module: {e}", file=sys.stderr)
      print("Make sure admin_connect.py, policy_engine.py, service_mapper.py, nlp.py are in the same directory or Python path.", file=sys.stderr)
+     # Define as None so class definition doesn't fail immediately
      admin_connect = None
      policy_engine = None
      service_mapper = None
-     sys.exit(1)
+     nlp = None
+     # Exit later if needed, or check within methods
+     # sys.exit(1) # Re-enable if strict check is needed
 
 # Redirect stdout/stderr (optional, captures 'print' statements)
 class StreamRedirector(QObject):
@@ -119,7 +119,7 @@ class StreamRedirector(QObject):
     def write(self, text):
         if text.strip(): # Avoid sending empty lines
             # noinspection PyUnresolvedReferences
-            self.write_signal.emit(f"[{self.stream_name}] {text}")
+            self.write_signal.emit(f"[{self.stream_name}] {text.strip()}") # Strip here too
 
     def flush(self):
         pass # No-op needed for stream interface
@@ -135,10 +135,16 @@ stderr_redirector = StreamRedirector('stderr') # Redirect stderr if desired
 # --- Main GUI Class ---
 class AdminGUI(QMainWindow):
     # Store generated commands between preview and send
-    _previewed_commands: list[tuple[str, str, list[str]]] = []
+    _previewed_commands: list[tuple[str, str | None, str | None, list[str]]] = [] # Updated type hint
     _selected_target_ip: str | None = None
 
     def __init__(self):
+        # Ensure backend modules were loaded
+        if not all([admin_connect, policy_engine, service_mapper, nlp]):
+            QMessageBox.critical(None, "Import Error", "One or more backend modules failed to load. Cannot start GUI.")
+            # Need to exit cleanly if QApplication hasn't started yet
+            sys.exit("Backend module import failed") # Exit before super().__init__
+
         super().__init__()
         self.setWindowTitle("Admin Controller")
         self.setGeometry(100, 100, 800, 600) # Adjusted size
@@ -268,23 +274,29 @@ class AdminGUI(QMainWindow):
         """Triggers initial load of service mapper and logs status."""
         self.append_log("[GUI] Initializing service mappings...")
         # Use a common service to trigger load
-        _ = service_mapper.get_service_params("ssh")
-        if service_mapper._service_mappings is None: # Check internal flag if possible
-             self.append_log("[GUI ERROR] Service mapper failed initial load. Check console/logs.")
-             QMessageBox.critical(self, "Config Error", "Failed to load services.json. Policy commands may not work correctly.")
-        elif not service_mapper._service_mappings: # Empty map after load attempt
-             self.append_log("[GUI WARN] Service mappings loaded but are empty. Check services.json.")
-             QMessageBox.warning(self, "Config Warning", "Service mapping file loaded but is empty. Check services.json.")
-        else:
-             self.append_log("[GUI] Service mappings initialized.")
+        try:
+            _ = service_mapper.get_service_params("ssh") # Trigger load
+            # Check internal flag if possible (requires service_mapper exposing it or returning status)
+            if service_mapper._service_mappings is None: # Access internal directly (less ideal)
+                 self.append_log("[GUI ERROR] Service mapper failed initial load. Check console/logs.")
+                 QMessageBox.critical(self, "Config Error", "Failed to load services.json. Policy commands may not work correctly.")
+            elif not service_mapper._service_mappings: # Empty map after load attempt
+                 self.append_log("[GUI WARN] Service mappings loaded but are empty. Check services.json.")
+                 QMessageBox.warning(self, "Config Warning", "Service mapping file loaded but is empty. Check services.json.")
+            else:
+                 self.append_log("[GUI] Service mappings initialized.")
+        except Exception as e:
+            self.append_log(f"[GUI CRITICAL] Failed during service mapper init: {e}")
+            logging.exception("Service mapper init failed")
+            QMessageBox.critical(self, "Config Error", f"Failed to initialize service mapper:\n{e}")
 
 
     def append_log(self, message):
         """Safely appends a message to the log view."""
-        if self._is_closing: return # Don't log during shutdown
+        # Using the corrected 'append' method
+        if self._is_closing: return
         try:
-             # Ensure log messages are appended on the main GUI thread if coming from signals
-             self.log_view.append(message.strip())
+             self.log_view.append(message.strip()) # Use append()
              # Optional: Auto-scroll to the bottom
              self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
         except Exception as e:
@@ -295,9 +307,10 @@ class AdminGUI(QMainWindow):
     def update_device_status(self):
         """Periodically checks backend status and updates the table."""
         if self._is_closing: return
+        if not admin_connect or not hasattr(admin_connect, 'devices_lock'): # Check if module loaded
+             return
         if not self.worker_thread or not self.worker_thread.is_alive():
             if any(d['status'] == 'Connected' for d in self.devices_status.values()):
-                 # Mark all as disconnected if thread died unexpectedly
                  for ip in list(self.devices_status.keys()):
                      self.devices_status[ip]['status'] = 'Disconnected'
                  self.refresh_device_table()
@@ -373,11 +386,14 @@ class AdminGUI(QMainWindow):
 
             # Restore selection if the IP is still present
             if new_selection_row != -1:
+                 # Block signals temporarily to prevent re-triggering clear_preview
+                 self.device_table.blockSignals(True)
                  self.device_table.selectRow(new_selection_row)
+                 self.device_table.blockSignals(False)
             elif selected_ip is not None: # Selection disappeared
+                 # Don't clear preview here, let user interaction do it
                  self._selected_target_ip = None
                  self.target_label.setText("Selected Target: None")
-
 
             self.device_table.setSortingEnabled(True) # Re-enable sorting
         except Exception as e:
@@ -396,12 +412,15 @@ class AdminGUI(QMainWindow):
                 if new_ip != self._selected_target_ip:
                      self._selected_target_ip = new_ip
                      self.target_label.setText(f"Selected Target: {self._selected_target_ip}")
-                     self.clear_preview() # Clear preview when target changes via table
+                     self.clear_preview() # Clear preview when target changes via table selection
             else:
-                 self._selected_target_ip = None
-                 self.target_label.setText("Selected Target: None")
+                 # This case should be rare if a row is truly selected
+                 if self._selected_target_ip is not None:
+                      self._selected_target_ip = None
+                      self.target_label.setText("Selected Target: None")
+                      self.clear_preview()
         else:
-             # Only clear if selection truly disappears
+             # Selection cleared (e.g., clicked empty area)
              if self._selected_target_ip is not None:
                   self._selected_target_ip = None
                   self.target_label.setText("Selected Target: None")
@@ -410,6 +429,7 @@ class AdminGUI(QMainWindow):
 
     def start_backend(self):
         """Starts the admin_connect backend thread."""
+        if not admin_connect: return # Ensure module loaded
         if self._is_closing: return
         if self.worker_thread and self.worker_thread.is_alive():
             self.append_log("[GUI] Backend is already running.")
@@ -452,10 +472,11 @@ class AdminGUI(QMainWindow):
 
     def stop_backend(self):
         """Signals the admin_connect backend thread to stop."""
+        if not admin_connect: return # Ensure module loaded
         if self._is_closing: return
         if not self.worker_thread or not self.worker_thread.is_alive():
             self.append_log("[GUI] Backend is not running.")
-            if self.start_btn.isEnabled() == False: # Ensure buttons are correct state
+            if not self.start_btn.isEnabled(): # Ensure buttons are correct state
                  self.start_btn.setEnabled(True)
                  self.stop_btn.setEnabled(False)
             self.status_timer.stop()
@@ -467,17 +488,10 @@ class AdminGUI(QMainWindow):
 
         try:
             admin_connect.stop_event.set() # Signal backend to stop
-
-            # Give the thread some time to stop gracefully
-            # Don't block the GUI thread for too long with join()
-            # Instead, we can periodically check is_alive() or rely on daemon=True
-            # For now, just log the signal sent.
             self.append_log("[GUI] Backend stop signal sent. Thread will exit.")
-
         except Exception as e:
              self.append_log(f"[GUI ERROR] Error signaling backend thread to stop: {e}")
              logging.exception("GUI failed to signal backend stop")
-
         finally:
              # Reset state even if signaling failed
              self.worker_thread = None # Clear the thread reference
@@ -491,10 +505,12 @@ class AdminGUI(QMainWindow):
         if self._is_closing: return
         self._previewed_commands = []
         self.preview_area.clear()
+        self.preview_area.setPlaceholderText("Generated iptables commands will appear here after preview...")
         self.send_btn.setEnabled(False)
 
     def preview_policy(self):
         """Parses the NL command and shows generated commands in the preview area."""
+        if not policy_engine: return # Ensure module loaded
         if self._is_closing: return
         nl_command = self.nl_input.text().strip()
         if not nl_command:
@@ -507,7 +523,7 @@ class AdminGUI(QMainWindow):
         QApplication.processEvents() # Allow GUI to update
 
         try:
-            # Use the new function from policy_engine
+            # Use the updated function from policy_engine
             generated_tuples = policy_engine.parse_and_generate_commands(nl_command)
 
             if not generated_tuples:
@@ -518,8 +534,14 @@ class AdminGUI(QMainWindow):
 
             self._previewed_commands = generated_tuples # Store for sending
             preview_text = ""
-            for i, (target_ip, subject_ip, cmd_list) in enumerate(generated_tuples):
-                 preview_text += f"--- Rule {i+1} (Subject: {subject_ip}, Target Device: {target_ip}) ---\n"
+            # Adapt loop for new tuple structure
+            for i, (target_ip, source_ip, dest_ip, cmd_list) in enumerate(generated_tuples):
+                 context = []
+                 if source_ip: context.append(f"Source: {source_ip}")
+                 if dest_ip: context.append(f"Dest: {dest_ip}")
+                 context_str = ", ".join(context) if context else "General"
+                 preview_text += f"--- Rule {i+1} ({context_str} -> Target Device: {target_ip}) ---\n"
+
                  if not cmd_list:
                      preview_text += "  (No specific commands generated for this rule)\n"
                  for cmd in cmd_list:
@@ -540,6 +562,7 @@ class AdminGUI(QMainWindow):
 
     def send_policy(self):
         """Sends the commands stored from the preview step."""
+        if not admin_connect: return # Ensure module loaded
         if self._is_closing: return
         if not self._previewed_commands:
             QMessageBox.warning(self, "Send Error", "No commands previewed to send. Please Preview first.")
@@ -557,15 +580,16 @@ class AdminGUI(QMainWindow):
 
         commands_sent_count = 0
         errors_occurred = False
-        total_expected_commands = sum(len(cl) for _, _, cl in self._previewed_commands)
+        total_expected_commands = sum(len(cl) for _, _, _, cl in self._previewed_commands)
 
-        for target_ip, _, cmd_list in self._previewed_commands:
-            # Check if target device is actually connected (optional but good)
+        # Adapt loop for new tuple structure
+        for target_ip, _, _, cmd_list in self._previewed_commands: # Don't need src/dest here
             is_connected = False
             try:
                  if admin_connect.clients_lock.acquire(timeout=0.1):
                      try:
-                         is_connected = target_ip in admin_connect.clients
+                         # Ensure clients dict exists before accessing
+                         is_connected = hasattr(admin_connect, 'clients') and target_ip in admin_connect.clients
                      finally:
                          admin_connect.clients_lock.release()
                  else:
@@ -579,8 +603,6 @@ class AdminGUI(QMainWindow):
             if not is_connected:
                  warning_msg = f"Target device {target_ip} is not currently connected. Skipping {len(cmd_list)} command(s) for this target."
                  self.append_log(f"[GUI WARN] {warning_msg}")
-                 # Don't show popup for every disconnected device if many rules
-                 # QMessageBox.warning(self, "Send Warning", warning_msg)
                  errors_occurred = True # Treat as an error for feedback
                  continue # Skip commands for this disconnected target
 
@@ -619,46 +641,45 @@ class AdminGUI(QMainWindow):
     def closeEvent(self, event):
         """Ensure backend stops when GUI is closed."""
         if self._is_closing: # Prevent recursion
-             event.accept()
+             if event: event.accept()
              return
 
         self._is_closing = True # Set closing flag
         self.append_log("[GUI] Close event triggered. Shutting down...")
+        print("GUI Close event triggered. Shutting down...", file=original_stderr) # Also to console
 
         # Stop the timer first
         self.status_timer.stop()
         self.append_log("[GUI] Status timer stopped.")
 
         # Stop the backend thread if running
-        if self.worker_thread and self.worker_thread.is_alive():
+        if admin_connect and self.worker_thread and self.worker_thread.is_alive():
              self.append_log("[GUI] Signaling backend thread to stop...")
              admin_connect.stop_event.set()
-             # Don't wait indefinitely, GUI needs to close
-             # self.worker_thread.join(timeout=1.5)
-             # if self.worker_thread.is_alive():
-             #      self.append_log("[GUI WARN] Backend thread did not exit after 1.5s.")
-             # else:
-             #      self.append_log("[GUI] Backend thread stopped.")
+             # Don't join here - let main thread exit / rely on daemon
         else:
-             self.append_log("[GUI] Backend thread was not running.")
+             self.append_log("[GUI] Backend thread was not running or module not loaded.")
 
         # Restore stdout/stderr
         sys.stdout = original_stdout
         sys.stderr = original_stderr
-        self.append_log("[GUI] Restored stdout/stderr.") # This will go to original console
+        # Don't use append_log here as it might already be broken
+        print("[GUI] Restored stdout/stderr.", file=original_stderr)
 
-        self.append_log("[GUI] Shutdown complete. Accepting close event.")
         print("GUI Shutdown complete.", file=original_stderr) # Final message to console
-        event.accept() # Accept the close event
+        if event: event.accept() # Accept the close event
 
 
 if __name__ == "__main__":
     # Basic console logging setup for issues BEFORE GUI/Qt handler takes over
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s', datefmt='%H:%M:%S')
 
+    # Check required modules before starting App
+    if not all([QApplication, admin_connect, policy_engine, service_mapper, nlp]):
+         print("ERROR: Essential Qt components or backend modules failed to load. Exiting.", file=sys.stderr)
+         sys.exit(1)
+
     app = QApplication(sys.argv)
     main_window = AdminGUI()
     main_window.show()
     sys.exit(app.exec())
-
-# --- END OF FILE admin.py ---
