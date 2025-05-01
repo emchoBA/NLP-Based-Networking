@@ -20,8 +20,95 @@ ACTION_TO_IPTABLES_TARGET = {
     "block": "DROP", "deny": "DROP", "drop": "DROP", "reject": "DROP",
     "allow": "ACCEPT", "permit": "ACCEPT", "accept": "ACCEPT",
 }
+def parse_and_generate_commands(nl_text: str) -> list[tuple[str, str, list[str]]]:
+    """
+    Parses NL text, generates commands, but returns them instead of sending.
+
+    Args:
+        nl_text: The natural language policy string.
+
+    Returns:
+        A list of tuples. Each tuple contains:
+        (target_device_ip, subject_ip, list_of_generated_commands_for_this_rule)
+        Returns an empty list if no valid rules/commands are generated.
+    """
+    print(f"\n[ENGINE] Parsing and generating commands for: '{nl_text}'")
+    rules = parse_commands(nl_text) # From nlp.py
+
+    if not rules:
+        print("[ENGINE] No valid rules derived from text.")
+        return []
+
+    all_generated_commands = []
+
+    for i, rule in enumerate(rules):
+        print(f"[ENGINE] Processing Rule {i+1}: {rule}")
+        action_verb = rule.get('action')
+        service_name = rule.get('service')
+        subject_ip = rule.get('subject_ip')
+        subject_ip_direction = rule.get('subject_ip_direction')
+        target_device_ip = rule.get('target_device_ip')
+
+        # Validate essential components
+        if not all([action_verb, subject_ip, target_device_ip]):
+            print(f"[ENGINE WARN] Rule {i+1} is incomplete ({rule}). Skipping generation for this rule.")
+            continue
+
+        iptables_target = ACTION_TO_IPTABLES_TARGET.get(action_verb)
+        if not iptables_target:
+            print(f"[ENGINE WARN] Unknown action verb '{action_verb}' in rule {i+1}. Skipping generation.")
+            continue
+
+        # Determine base chain/flag (same logic as process_and_dispatch)
+        chain = "INPUT"; ip_flag = "-s" # Defaults
+        if subject_ip_direction == "from":
+            chain = "INPUT"; ip_flag = "-s"
+        elif subject_ip_direction == "to":
+            if target_device_ip == subject_ip:
+                 chain = "OUTPUT"; ip_flag = "-d"
+            else:
+                 chain = "INPUT"; ip_flag = "-d"
+        elif subject_ip_direction is None:
+             chain = "INPUT"; ip_flag = "-s"
+
+        # Generate command(s) based on service (using service_mapper)
+        commands_for_this_rule = []
+        base_cmd_parts = ["iptables", "-A", chain, ip_flag, subject_ip]
+
+        if service_name in SERVICES_TO_IGNORE:
+            cmd_parts = base_cmd_parts + ["-j", iptables_target]
+            commands_for_this_rule.append(" ".join(cmd_parts))
+        else:
+            param_list = service_mapper.get_service_params(service_name)
+            if param_list:
+                for param_dict in param_list:
+                    cmd_parts = list(base_cmd_parts)
+                    proto = param_dict.get("proto")
+                    dport = param_dict.get("dport")
+                    if proto:
+                        cmd_parts.extend(["-p", proto])
+                        if proto in ["tcp", "udp"] and dport is not None:
+                             cmd_parts.extend(["--dport", str(dport)])
+                    cmd_parts.extend(["-j", iptables_target])
+                    commands_for_this_rule.append(" ".join(cmd_parts))
+            else:
+                 # Service not found or ignored -> IP only rule
+                 cmd_parts = base_cmd_parts + ["-j", iptables_target]
+                 commands_for_this_rule.append(" ".join(cmd_parts))
+
+        if commands_for_this_rule:
+            print(f"[ENGINE] For Rule {i+1}, generated {len(commands_for_this_rule)} command(s) targeting device {target_device_ip}.")
+            # Add the result for this rule to the overall list
+            all_generated_commands.append(
+                (target_device_ip, subject_ip, commands_for_this_rule)
+            )
+        else:
+             print(f"[ENGINE WARN] No commands were generated for rule {i+1}.")
+
+    return all_generated_commands
 
 def process_and_dispatch(nl_text: str):
+    # stayed for testing purposes but useless as of now
     """
     Processes natural language, generates potentially multiple iptables
     commands based on service mappings obtained from service_mapper,
