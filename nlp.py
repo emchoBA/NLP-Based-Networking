@@ -1,6 +1,7 @@
 import spacy
 from spacy.matcher import Matcher
 import logging # Use logging
+import re # Import regular expressions
 import alias_manager # Import the alias manager
 
 # --- Get Logger specific to this module ---
@@ -41,42 +42,40 @@ BOUNDARY_PREPS = TARGET_DEVICE_PREPS.union(SOURCE_IP_PREPS).union(DESTINATION_IP
 def preprocess_and_resolve_aliases(text: str) -> str:
     """
     1. Basic preprocessing (lowercase, strip, reduce spaces).
-    2. Iteratively find and replace known aliases with their IP addresses.
-       This is a simpler string-replacement approach before full spaCy parsing.
+    2. Iteratively find and replace known aliases with their IP addresses using regex.
     """
+    # Initial cleanup: lowercase, strip whitespace, normalize multiple spaces
     processed_text = text.strip().lower()
-    # Replace commas early, they can interfere with alias multi-word matching
-    processed_text = processed_text.replace(',', ' ')
+    processed_text = processed_text.replace(',', ' ') # Replace commas with spaces
     processed_text = " ".join(processed_text.split()) # Normalize spaces
 
-    if not alias_manager: # Should not happen if imported correctly
+    if not alias_manager:
         log.warning("[NLP Preprocess] alias_manager not available. Skipping alias resolution.")
         return processed_text
 
-    # Iterate to replace aliases. This might need to be more sophisticated
-    # if aliases can contain other aliases, but for simple cases this works.
-    # We get all aliases and sort them by length (longest first) to avoid
-    # shorter aliases (e.g., "server") matching parts of longer ones ("web server").
     all_aliases = alias_manager.get_all_aliases() # Returns {alias_lower: ip}
-    # Sort by length of alias descending
+    if not all_aliases:
+        log.debug("[NLP Preprocess] No aliases defined in alias_manager.")
+        return processed_text
+
+    # Sort by length of alias descending to handle overlapping aliases correctly
+    # (e.g., "web server" before "server")
     sorted_alias_keys = sorted(all_aliases.keys(), key=len, reverse=True)
 
     original_text_for_logging = processed_text
     for alias_key in sorted_alias_keys:
         ip_address = all_aliases[alias_key]
-        # Replace whole word alias only to avoid partial matches within words
-        # Using f" {alias_key} " ensures spaces, also check start/end of string
-        # This is still a bit crude for multi-word aliases if they aren't space-separated from prepositions.
-        # A regex replacement might be better: r'\b' + re.escape(alias_key) + r'\b'
-        # For now, let's try direct replacement and see.
-        if f" {alias_key} " in f" {processed_text} ": # Check with surrounding spaces
-            processed_text = processed_text.replace(f" {alias_key} ", f" {ip_address} ")
-        elif processed_text.startswith(f"{alias_key} "):
-            processed_text = processed_text.replace(f"{alias_key} ", f"{ip_address} ", 1)
-        elif processed_text.endswith(f" {alias_key}"):
-            processed_text = processed_text.replace(f" {alias_key}", f" {ip_address}")
-        elif processed_text == alias_key: # Alias is the whole string
-            processed_text = ip_address
+        # Use regex for whole word replacement (case-insensitive due to prior lowercasing of text)
+        # re.escape is important if aliases can contain special regex characters
+        pattern = r'\b' + re.escape(alias_key) + r'\b'
+        # Count occurrences for logging, then replace
+        # num_occurrences = len(re.findall(pattern, processed_text))
+        # if num_occurrences > 0:
+        processed_text_before_replace = processed_text
+        processed_text = re.sub(pattern, ip_address, processed_text)
+        # if processed_text != processed_text_before_replace:
+        #      log.debug(f"[NLP Preprocess] Replaced '{alias_key}' with '{ip_address}' ({num_occurrences} times)")
+
 
     if original_text_for_logging != processed_text:
         log.info(f"[NLP Preprocess] Resolved aliases: '{original_text_for_logging}' -> '{processed_text}'")
@@ -85,14 +84,15 @@ def preprocess_and_resolve_aliases(text: str) -> str:
 
     return " ".join(processed_text.split()) # Final space normalization
 
+
 def parse_single(cmd: str) -> dict:
     """
     Parse one clause AFTER aliases have been resolved in the input string.
     (Based on your provided working version)
     """
-    # Alias resolution now happens in preprocess_and_resolve_aliases,
-    # called by parse_commands before this. So 'cmd' here should have IPs.
-    doc = nlp(cmd) # cmd is already preprocessed and aliases resolved
+    # 'cmd' here is assumed to be a single sentence string, already preprocessed
+    # and with aliases resolved to IPs by the calling function (parse_commands).
+    doc = nlp(cmd)
 
     result = {
         "action": None, "service": None,
@@ -116,86 +116,87 @@ def parse_single(cmd: str) -> dict:
                 result["service"] = tl
                 break
 
-    # Use ip_matcher (renamed from global 'matcher' to avoid confusion if any)
     ip_matches_found = []
-    for match_id, start, end in ip_matcher(doc): # Use ip_matcher here
+    for match_id, start, end in ip_matcher(doc):
         ip_text = doc[start:end].text
         preceding_token_lemma = doc[start - 1].lemma_.lower() if start > 0 else None
         ip_matches_found.append({
             "ip": ip_text,
             "prep": preceding_token_lemma,
-            "start_index": start # For debugging or more complex logic later
+            "start_index": start
         })
 
-    log.debug(f"[NLP] Found IP matches in (alias-resolved) clause '{doc.text}': {ip_matches_found}")
+    log.debug(f"[NLP parse_single] IP matches in '{doc.text}': {ip_matches_found}")
 
     target_assigned_explicitly = False
     source_assigned = False
     destination_assigned = False
     remaining_matches = list(ip_matches_found)
 
-    temp_remaining = []
+    # Priority 1: Explicit Target Device ("on"/"at")
+    temp_remaining_target = []
     for match in remaining_matches:
         if match["prep"] in TARGET_DEVICE_PREPS:
             if not result["target_device_ip"]:
                 result["target_device_ip"] = match["ip"]
                 target_assigned_explicitly = True
-                log.debug(f"[NLP] Assigned Explicit Target IP: {match['ip']} (from '{match['prep']}')")
+                log.debug(f"[NLP] Explicit Target IP: {match['ip']} (from '{match['prep']}')")
             else:
                  log.warning(f"[NLP] Multiple 'on/at' IPs. Using first: {result['target_device_ip']}. Ignoring: {match['ip']}")
-                 temp_remaining.append(match)
+                 temp_remaining_target.append(match)
         else:
-            temp_remaining.append(match)
-    remaining_matches = temp_remaining
+            temp_remaining_target.append(match)
+    remaining_matches = temp_remaining_target
 
-    temp_remaining = []
+    # Priority 2: Source IP ("from")
+    temp_remaining_source = []
     for match in remaining_matches:
         if match["prep"] in SOURCE_IP_PREPS:
             if not result["source_ip"]:
                 result["source_ip"] = match["ip"]
                 source_assigned = True
-                log.debug(f"[NLP] Assigned Source IP: {match['ip']} (from '{match['prep']}')")
+                log.debug(f"[NLP] Source IP: {match['ip']} (from '{match['prep']}')")
             else:
                 log.warning(f"[NLP] Multiple 'from' IPs. Using first: {result['source_ip']}. Ignoring: {match['ip']}")
         else:
-            temp_remaining.append(match)
-    remaining_matches = temp_remaining
+            temp_remaining_source.append(match)
+    remaining_matches = temp_remaining_source
 
-    temp_remaining = []
+    # Priority 3: Destination IP ("to")
+    temp_remaining_dest = []
     for match in remaining_matches:
         if match["prep"] in DESTINATION_IP_PREPS:
             if not result["destination_ip"]:
                 result["destination_ip"] = match["ip"]
                 destination_assigned = True
-                log.debug(f"[NLP] Assigned Destination IP: {match['ip']} (from '{match['prep']}')")
+                log.debug(f"[NLP] Destination IP: {match['ip']} (from '{match['prep']}')")
             else:
                 log.warning(f"[NLP] Multiple 'to' IPs. Using first: {result['destination_ip']}. Ignoring: {match['ip']}")
         else:
-            temp_remaining.append(match)
-    remaining_matches = temp_remaining
+            temp_remaining_dest.append(match)
+    remaining_matches = temp_remaining_dest
 
+    # Priority 4: Unassigned IP (Default single remaining IP to Source)
     if len(remaining_matches) == 1 and not source_assigned and not destination_assigned:
         match = remaining_matches[0]
         result["source_ip"] = match["ip"]
-        source_assigned = True
-        log.debug(f"[NLP] Assigned remaining IP as Source IP (default): {match['ip']}")
+        source_assigned = True # Mark as assigned
+        log.debug(f"[NLP] Defaulted remaining IP as Source IP: {match['ip']}")
         remaining_matches.pop(0)
 
     if remaining_matches:
-         log.warning(f"[NLP] Unassigned IP addresses remaining after parsing: {[m['ip'] for m in remaining_matches]}")
+         log.warning(f"[NLP] Unassigned IPs after all assignments: {[m['ip'] for m in remaining_matches]}")
 
     if not target_assigned_explicitly:
-        if destination_assigned:
-            result["target_device_ip"] = result["destination_ip"]
-        elif source_assigned:
-            result["target_device_ip"] = result["source_ip"]
+        if destination_assigned: result["target_device_ip"] = result["destination_ip"]
+        elif source_assigned: result["target_device_ip"] = result["source_ip"]
 
     if not result["action"] or not result["target_device_ip"] or not (result["source_ip"] or result["destination_ip"]):
         log.warning(f"[NLP] Validation failed for '{doc.text}'. Result: {result}")
         return {}
 
     if result["action"] and not result["service"]: result["service"] = "any"
-    log.info(f"[NLP] Parsed Result from '{doc.text}': {result}")
+    log.info(f"[NLP] Final Parsed Result for '{doc.text}': {result}")
     return result
 
 def parse_commands(text: str) -> list:
@@ -205,15 +206,14 @@ def parse_commands(text: str) -> list:
     3. Parses each sentence using parse_single.
     4. Returns a list of valid dictionaries.
     """
-    # Preprocess and resolve aliases ONCE for the entire input string
     resolved_text = preprocess_and_resolve_aliases(text)
-    doc = nlp(resolved_text) # spaCy processes the alias-resolved text
+    doc = nlp(resolved_text)
     out = []
     log.debug(f"\n[NLP] Parsing (alias-resolved) text: '{resolved_text}'")
 
     for i, sent in enumerate(doc.sents):
         log.debug(f"[NLP] Processing sentence {i+1}: '{sent.text}'")
-        # parse_single now gets a sentence string that already has IPs, not aliases
+        # Pass the sentence string (which already has IPs from resolved_text)
         cmd_dict = parse_single(sent.text)
         if cmd_dict:
             out.append(cmd_dict)
@@ -223,28 +223,28 @@ def parse_commands(text: str) -> list:
     log.debug(f"[NLP] Finished parsing. Found {len(out)} command(s) total.")
     return out
 
-
 # Example usage
 if __name__ == "__main__":
-    logging.getLogger("nlp").setLevel(logging.DEBUG) # Show debug for this module
-    logging.getLogger("alias_manager").setLevel(logging.DEBUG) # And for alias manager
-
-    # Setup some aliases for testing
-    if alias_manager:
+    logging.getLogger("nlp").setLevel(logging.DEBUG)
+    if alias_manager: # Ensure alias_manager is available for testing
+        logging.getLogger("alias_manager").setLevel(logging.DEBUG)
         alias_manager.add_alias("192.168.1.11", "DeviceA")
         alias_manager.add_alias("192.168.1.12", "DeviceB")
         alias_manager.add_alias("10.0.0.1", "Gateway")
         alias_manager.add_alias("10.0.0.2", "WebServer")
-        alias_manager.add_alias("company server", "10.0.0.3") # Multi-word alias
+        alias_manager.add_alias("company server one", "10.0.0.3") # Multi-word alias
+    else:
+        print("WARNING: alias_manager not imported, alias tests will not work as expected.")
+
 
     tests = [
         # --- Alias Tests ---
         "on DeviceA deny ssh from 192.168.1.12",
         "allow http from DeviceB to Gateway",
-        "block WebServer",
+        "block WebServer", # Should resolve WebServer to IP
         "at Gateway reject 192.168.1.11",
-        "permit traffic from Company Server to DeviceA",
-        # --- Original Tests (should still work) ---
+        "permit traffic from company server one to DeviceA", # Test multi-word
+        # --- Original Tests ---
         "deny ssh from 192.168.1.12 to 192.168.1.11",
         "allow http from 10.0.0.5 to 192.168.1.11",
         "on 192.168.1.1 permit tcp from 192.168.1.12 to 192.168.1.11",
@@ -252,6 +252,11 @@ if __name__ == "__main__":
         "block 1.1.1.1",
         # --- Multi-sentence test with aliases ---
         "on DeviceA deny DeviceB. allow ssh to Gateway.",
+        # --- Test cases that were failing before ---
+        "allow pop3 from DeviceB",
+        "reject telnet to DeviceA",
+        "on DeviceA deny rdp from DeviceB",
+        "on DeviceA allow ssh from DeviceB. at DeviceB deny all traffic from DeviceA."
     ]
     all_results = []
     for test_cmd in tests:
