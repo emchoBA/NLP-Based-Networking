@@ -88,11 +88,13 @@ def preprocess_and_resolve_aliases(text: str) -> str:
 def parse_single(cmd: str) -> dict:
     """
     Parse one clause AFTER aliases have been resolved in the input string.
-    (Based on your provided working version)
     """
     # 'cmd' here is assumed to be a single sentence string, already preprocessed
     # and with aliases resolved to IPs by the calling function (parse_commands).
     doc = nlp(cmd)
+
+    log.debug(
+        f"[NLP parse_single] Input to parse_single (after alias resolution and sentence split): '{cmd}'")  # Log input
 
     result = {
         "action": None, "service": None,
@@ -107,17 +109,59 @@ def parse_single(cmd: str) -> dict:
             action_idx = i
             break
 
+    # 2) SERVICE: Find the first relevant noun after the action (if action exists)
     if action_idx != -1:
-        for tok in doc[action_idx + 1:]:
-            if tok.is_stop or tok.is_punct: continue
-            tl = tok.lemma_.lower()
-            if tl in BOUNDARY_PREPS: break
-            if tok.is_alpha:
-                result["service"] = tl
+        log.debug(
+            f"[NLP parse_single] Searching for service after action '{result['action']}' in: '{doc[action_idx + 1:].text}'")
+        service_found_flag = False  # Flag to see if we ever assign it
+        for i, tok in enumerate(doc[action_idx + 1:]):
+            actual_token_index_in_doc = action_idx + 1 + i  # Index in the full 'doc'
+
+            # Ensure we don't go out of bounds if action_idx was the last token (unlikely but safe)
+            if actual_token_index_in_doc >= len(doc):
                 break
 
+            log.debug(
+                f"[NLP parse_single] Service check: token='{tok.text}', lemma='{tok.lemma_}', is_alpha={tok.is_alpha}, is_stop={tok.is_stop}, is_punct={tok.is_punct}")
+
+            if tok.is_stop or tok.is_punct:
+                log.debug(f"[NLP parse_single] Skipping token '{tok.text}' (stop/punct).")
+                continue
+
+            tl = tok.lemma_.lower()
+
+            # Check if the current token starts an IP address (more robust boundary)
+            # This means if we see "allow 192.168.1.10 ..." it won't mistake 192 for service
+            is_ip_check_span = doc[actual_token_index_in_doc: actual_token_index_in_doc + 1]
+            if ip_matcher(is_ip_check_span):  # Check if the token itself is an IP
+                log.debug(f"[NLP parse_single] Token '{tok.text}' is an IP. Stopping service search.")
+                break
+
+            if tl in BOUNDARY_PREPS:  # Stop if we hit any IP-related preposition
+                log.debug(
+                    f"[NLP parse_single] Token '{tok.text}' (lemma '{tl}') is a boundary preposition. Stopping service search.")
+                break
+
+            if tok.is_alpha:  # Must be alphabetic
+                result["service"] = tl
+                service_found_flag = True  # Mark service as found
+                log.debug(f"[NLP parse_single] Service FOUND: '{result['service']}' from token '{tok.text}'")
+                break  # Found the service
+            else:
+                # If it's not alpha, not stop/punct, not an IP, and not a boundary, stop.
+                # This could be a number or other symbol that shouldn't be a service.
+                log.debug(
+                    f"[NLP parse_single] Token '{tok.text}' is not alpha (and not other known category). Stopping service search here.")
+                break
+
+        if not service_found_flag:
+            log.debug(
+                f"[NLP parse_single] No specific service found after action. Defaulting to 'any' if needed later.")
+            # Defaulting to 'any' now happens at the end of parse_single if service is still None
+
+    # 3) IPs: Find all IP addresses and try to determine their roles
     ip_matches_found = []
-    for match_id, start, end in ip_matcher(doc):
+    for match_id, start, end in ip_matcher(doc):  # Use ip_matcher here
         ip_text = doc[start:end].text
         preceding_token_lemma = doc[start - 1].lemma_.lower() if start > 0 else None
         ip_matches_found.append({
@@ -140,10 +184,11 @@ def parse_single(cmd: str) -> dict:
             if not result["target_device_ip"]:
                 result["target_device_ip"] = match["ip"]
                 target_assigned_explicitly = True
-                log.debug(f"[NLP] Explicit Target IP: {match['ip']} (from '{match['prep']}')")
+                log.debug(f"[NLP parse_single] Explicit Target IP: {match['ip']} (from '{match['prep']}')")
             else:
-                 log.warning(f"[NLP] Multiple 'on/at' IPs. Using first: {result['target_device_ip']}. Ignoring: {match['ip']}")
-                 temp_remaining_target.append(match)
+                log.warning(
+                    f"[NLP parse_single] Multiple 'on/at' IPs. Using first: {result['target_device_ip']}. Ignoring: {match['ip']}")
+                temp_remaining_target.append(match)
         else:
             temp_remaining_target.append(match)
     remaining_matches = temp_remaining_target
@@ -155,9 +200,10 @@ def parse_single(cmd: str) -> dict:
             if not result["source_ip"]:
                 result["source_ip"] = match["ip"]
                 source_assigned = True
-                log.debug(f"[NLP] Source IP: {match['ip']} (from '{match['prep']}')")
+                log.debug(f"[NLP parse_single] Source IP: {match['ip']} (from '{match['prep']}')")
             else:
-                log.warning(f"[NLP] Multiple 'from' IPs. Using first: {result['source_ip']}. Ignoring: {match['ip']}")
+                log.warning(
+                    f"[NLP parse_single] Multiple 'from' IPs. Using first: {result['source_ip']}. Ignoring: {match['ip']}")
         else:
             temp_remaining_source.append(match)
     remaining_matches = temp_remaining_source
@@ -169,9 +215,10 @@ def parse_single(cmd: str) -> dict:
             if not result["destination_ip"]:
                 result["destination_ip"] = match["ip"]
                 destination_assigned = True
-                log.debug(f"[NLP] Destination IP: {match['ip']} (from '{match['prep']}')")
+                log.debug(f"[NLP parse_single] Destination IP: {match['ip']} (from '{match['prep']}')")
             else:
-                log.warning(f"[NLP] Multiple 'to' IPs. Using first: {result['destination_ip']}. Ignoring: {match['ip']}")
+                log.warning(
+                    f"[NLP parse_single] Multiple 'to' IPs. Using first: {result['destination_ip']}. Ignoring: {match['ip']}")
         else:
             temp_remaining_dest.append(match)
     remaining_matches = temp_remaining_dest
@@ -180,23 +227,40 @@ def parse_single(cmd: str) -> dict:
     if len(remaining_matches) == 1 and not source_assigned and not destination_assigned:
         match = remaining_matches[0]
         result["source_ip"] = match["ip"]
-        source_assigned = True # Mark as assigned
-        log.debug(f"[NLP] Defaulted remaining IP as Source IP: {match['ip']}")
+        source_assigned = True  # Mark as assigned
+        log.debug(f"[NLP parse_single] Defaulted remaining IP as Source IP: {match['ip']}")
         remaining_matches.pop(0)
 
     if remaining_matches:
-         log.warning(f"[NLP] Unassigned IPs after all assignments: {[m['ip'] for m in remaining_matches]}")
+        log.warning(
+            f"[NLP parse_single] Unassigned IPs after all assignments in '{doc.text}': {[m['ip'] for m in remaining_matches]}")
 
+    # --- Determine Final Target Device IP ---
     if not target_assigned_explicitly:
-        if destination_assigned: result["target_device_ip"] = result["destination_ip"]
-        elif source_assigned: result["target_device_ip"] = result["source_ip"]
+        if destination_assigned:
+            result["target_device_ip"] = result["destination_ip"]
+            log.debug(f"[NLP parse_single] Implicit Target IP set to Destination IP: {result['target_device_ip']}")
+        elif source_assigned:
+            result["target_device_ip"] = result["source_ip"]
+            log.debug(f"[NLP parse_single] Implicit Target IP set to Source IP: {result['target_device_ip']}")
 
-    if not result["action"] or not result["target_device_ip"] or not (result["source_ip"] or result["destination_ip"]):
-        log.warning(f"[NLP] Validation failed for '{doc.text}'. Result: {result}")
+    # --- Final Validation ---
+    if not result["action"]:
+        log.warning(f"[NLP parse_single] Validation failed for '{doc.text}': No action. Result: {result}")
+        return {}
+    if not result["target_device_ip"]:
+        log.warning(f"[NLP parse_single] Validation failed for '{doc.text}': No target device. Result: {result}")
+        return {}
+    if not result["source_ip"] and not result["destination_ip"]:
+        log.warning(f"[NLP parse_single] Validation failed for '{doc.text}': No source or dest IP. Result: {result}")
         return {}
 
-    if result["action"] and not result["service"]: result["service"] = "any"
-    log.info(f"[NLP] Final Parsed Result for '{doc.text}': {result}")
+    # If service wasn't found, default it
+    if result["action"] and not result["service"]:
+        result["service"] = "any"
+        log.debug(f"[NLP parse_single] Service defaulted to 'any' for action '{result['action']}'")
+
+    log.info(f"[NLP parse_single] Final Parsed Result for '{doc.text}': {result}")
     return result
 
 def parse_commands(text: str) -> list:
