@@ -1,21 +1,22 @@
-#!/usr/bin/env python3
+# !/usr/bin/env python3
 """
 policy_engine.py
 
 Uses enhanced NLP (source_ip, destination_ip), service_mapper,
 builds potentially complex iptables command(s), and prepares them for dispatch.
+Optionally uses a preferred_target_ip from GUI if rule isn't explicit.
 """
 
 import logging
-import service_mapper # Assuming service_mapper.py is available
-from nlp import parse_commands # Assuming nlp.py is available
-import admin_connect # Assuming admin_connect.py is available
+import service_mapper  # Assuming service_mapper.py is available
+from nlp import parse_commands  # Assuming nlp.py is available
+import admin_connect  # Assuming admin_connect.py is available
 
 # --- Get Logger ---
 log = logging.getLogger(__name__)
 if not log.hasHandlers():
-     # Basic config if run standalone
-     logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(name)s] %(levelname)s - %(message)s')
+    # Basic config if run standalone
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(name)s] %(levelname)s - %(message)s')
 
 # Services that don't use port/protocol specifics
 SERVICES_TO_IGNORE = {"any", "all", "traffic", None}
@@ -26,187 +27,236 @@ ACTION_TO_IPTABLES_TARGET = {
     "allow": "ACCEPT", "permit": "ACCEPT", "accept": "ACCEPT",
 }
 
-def parse_and_generate_commands(nl_text: str) -> list[tuple[str, str | None, str | None, list[str]]]:
+
+def parse_and_generate_commands(nl_text: str, preferred_target_ip: str | None = None) -> list[
+    tuple[str, str | None, str | None, list[str]]]:
     """
     Parses NL text, generates commands using source/destination IPs,
     and returns them for preview/dispatch.
+    Optionally uses a preferred_target_ip from GUI if rule has no explicit target.
 
     Args:
         nl_text: The natural language policy string.
+        preferred_target_ip: Optional IP from GUI selection to use if rule has no explicit target.
 
     Returns:
         A list of tuples. Each tuple contains:
-        (target_device_ip, source_ip, destination_ip, list_of_commands)
+        (final_target_device_ip, source_ip, destination_ip, list_of_commands)
         Returns an empty list if no valid rules/commands are generated.
     """
-    log.debug(f"[ENGINE] Parsing and generating commands for: '{nl_text}'")
-    rules = parse_commands(nl_text) # Uses enhanced nlp.py
+    log.debug(f"[ENGINE] Parsing for: '{nl_text}', Preferred Target from GUI: {preferred_target_ip}")
+    rules = parse_commands(nl_text)  # From nlp.py
 
     if not rules:
-        log.warning("[ENGINE] No valid rules derived from text.")
+        log.warning("[ENGINE] No valid rules derived from text by NLP.")
         return []
 
     all_generated_commands = []
 
     for i, rule in enumerate(rules):
-        log.debug(f"[ENGINE] Processing Rule {i+1}: {rule}")
+        log.debug(f"[ENGINE] Processing Parsed Rule {i + 1} from NLP: {rule}")
 
-        # --- Use new keys from NLP result ---
-        action_verb      = rule.get('action')
-        service_name     = rule.get('service')
-        source_ip        = rule.get('source_ip')
-        destination_ip   = rule.get('destination_ip')
-        target_device_ip = rule.get('target_device_ip') # WHERE the rule applies
+        action_verb = rule.get('action')
+        service_name = rule.get('service')
+        source_ip = rule.get('source_ip')
+        destination_ip = rule.get('destination_ip')
 
-        # Basic validation (already done partly in NLP, but good to double check)
-        if not all([action_verb, target_device_ip]) or not (source_ip or destination_ip):
-            log.warning(f"[ENGINE] Rule {i+1} is incomplete or lacks IP context ({rule}). Skipping generation.")
+        nlp_target_device_ip = rule.get('target_device_ip')
+        # This is the key field that might be overridden by GUI selection
+        final_target_device_ip = nlp_target_device_ip
+
+        # Logic to determine if NLP's target was explicit or implicit
+        # An NLP target is considered "explicit" if it was set by "on X" or "at X"
+        # and is NOT the same as the source_ip or destination_ip (unless that was the explicit target).
+        # This is a heuristic. A more robust NLP would pass an 'explicit_target_found' flag.
+        nlp_target_was_explicit = False
+        if nlp_target_device_ip:
+            # If nlp_target is different from both source and dest (and they exist), it was likely "on X"
+            if source_ip and destination_ip and \
+                    nlp_target_device_ip != source_ip and nlp_target_device_ip != destination_ip:
+                nlp_target_was_explicit = True
+            # If only source, and nlp_target is not source, it was "on X"
+            elif source_ip and not destination_ip and nlp_target_device_ip != source_ip:
+                nlp_target_was_explicit = True
+            # If only dest, and nlp_target is not dest, it was "on X"
+            elif destination_ip and not source_ip and nlp_target_device_ip != destination_ip:
+                nlp_target_was_explicit = True
+            # If NLP target is same as source/dest, it's only explicit if "on source_ip" was used.
+            # This requires checking the original command string, which is complex here.
+            # For now, we simplify: if preferred_target_ip is provided, and NLP's target *could* have been a default,
+            # we might override. If NLP's target is clearly different, we assume it was explicit.
+
+        if preferred_target_ip:
+            if not nlp_target_device_ip:  # NLP found no target at all
+                log.info(f"[ENGINE] NLP found no target device. Using GUI preferred '{preferred_target_ip}'.")
+                final_target_device_ip = preferred_target_ip
+            elif not nlp_target_was_explicit:
+                # If NLP's target seems like it was a default (e.g., same as source or dest)
+                # and not from an explicit "on/at" phrase that points elsewhere.
+                # (This condition can be tricky to get perfect without more info from NLP)
+                # A simpler override: If preferred_target is set, and NLP target is implicit.
+                is_nlp_target_implicit_default = False
+                if nlp_target_device_ip == source_ip and (not destination_ip or destination_ip == source_ip):
+                    is_nlp_target_implicit_default = True
+                elif nlp_target_device_ip == destination_ip:
+                    is_nlp_target_implicit_default = True
+
+                if is_nlp_target_implicit_default:
+                    log.info(
+                        f"[ENGINE] NLP target '{nlp_target_device_ip}' was implicit. Overriding with GUI preferred '{preferred_target_ip}'.")
+                    final_target_device_ip = preferred_target_ip
+                else:  # NLP target was different from src/dest, assume it was explicit "on X"
+                    log.debug(
+                        f"[ENGINE] NLP target '{nlp_target_device_ip}' appears explicit or preferred not applicable. Keeping NLP target.")
+            else:  # NLP target was explicit
+                log.debug(
+                    f"[ENGINE] NLP target '{nlp_target_device_ip}' was explicit. GUI preferred target '{preferred_target_ip}' ignored for this rule.")
+
+        # Final check for a target
+        if not final_target_device_ip:
+            log.warning(
+                f"[ENGINE] Rule {i + 1} has no resolvable target device after considering preferred. Parsed: {rule}. Skipping.")
+            continue
+
+        log.debug(f"[ENGINE] Final Target Device for rule {i + 1}: {final_target_device_ip}")
+
+        # Validate other essential parts
+        if not action_verb or not (source_ip or destination_ip):
+            log.warning(
+                f"[ENGINE] Rule {i + 1} incomplete. Action: {action_verb}, Src: {source_ip}, Dest: {destination_ip}. Skipping.")
             continue
 
         iptables_target = ACTION_TO_IPTABLES_TARGET.get(action_verb)
         if not iptables_target:
-            log.warning(f"[ENGINE] Unknown action verb '{action_verb}' in rule {i+1}. Skipping generation.")
+            log.warning(f"[ENGINE] Unknown action verb '{action_verb}' in rule {i + 1}. Skipping generation.")
             continue
 
-        # --- Determine Chain (Simplified Logic) ---
-        # This logic determines the chain ON the target_device_ip
-        chain = "INPUT" # Default
-        if target_device_ip == source_ip and destination_ip:
-             # Rule applied ON source, affecting traffic going TO destination -> OUTPUT
-             chain = "OUTPUT"
-             log.debug(f"[ENGINE] Chain set to OUTPUT (Target '{target_device_ip}' == Source '{source_ip}')")
-        elif target_device_ip == destination_ip and source_ip:
-             # Rule applied ON destination, affecting traffic coming FROM source -> INPUT
-             chain = "INPUT"
-             log.debug(f"[ENGINE] Chain set to INPUT (Target '{target_device_ip}' == Destination '{destination_ip}')")
-        elif source_ip and destination_ip:
-             # Rule applied on a third device (e.g., gateway) -> FORWARD (Ideal but complex)
-             # Defaulting to INPUT, assuming target filters INCOMING traffic that matches src/dest
-             chain = "INPUT" # Or FORWARD
-             log.debug(f"[ENGINE] Chain set to INPUT (Target '{target_device_ip}' != Source/Dest - assuming INPUT filter)")
-        elif source_ip: # Only source specified
-             # Applied on source device (target==source): Block outgoing FROM source? -> Not logical usually.
-             # Applied on other device: Block incoming from source? -> INPUT
-             chain = "INPUT"
-             log.debug(f"[ENGINE] Chain set to INPUT (Source IP '{source_ip}' only specified)")
-        elif destination_ip: # Only destination specified
-             # Applied on dest device (target==dest): Block outgoing TO dest? -> OUTPUT
-             # Applied on other device: Block incoming destined for dest? -> INPUT
-             # Defaulting to OUTPUT (block own traffic going TO destination)
-             chain = "OUTPUT"
-             log.debug(f"[ENGINE] Chain set to OUTPUT (Destination IP '{destination_ip}' only specified)")
-        else:
-             # Should not happen due to validation, but fallback
-             log.warning(f"[ENGINE] Could not determine chain reliably for rule {rule}. Defaulting to INPUT.")
-             chain = "INPUT"
+        # --- Determine Chain based on final_target_device_ip ---
+        chain = "INPUT"  # Default
+        if final_target_device_ip == source_ip and destination_ip:
+            chain = "OUTPUT"
+        elif final_target_device_ip == destination_ip and source_ip:
+            chain = "INPUT"
+        elif source_ip and destination_ip:  # Target is a third party (gateway)
+            chain = "FORWARD"  # If target is not src or dest, assume FORWARD
+        elif source_ip:  # Only source specified
+            if final_target_device_ip == source_ip:
+                chain = "OUTPUT"  # Rule on source, about its own outgoing traffic
+            else:
+                chain = "INPUT"  # Rule on other device, about incoming from source
+        elif destination_ip:  # Only destination specified
+            if final_target_device_ip == destination_ip:
+                chain = "OUTPUT"  # Rule on dest, about its own outgoing
+            else:
+                chain = "INPUT"  # Rule on other device, about incoming for dest
+        log.debug(f"[ENGINE] Chain determined as: {chain} for target {final_target_device_ip}")
 
-        # --- Build base command parts ---
         base_cmd_parts = ["iptables", "-A", chain]
-        if source_ip:
-            base_cmd_parts.extend(["-s", source_ip])
-        if destination_ip:
-            base_cmd_parts.extend(["-d", destination_ip])
+        if source_ip: base_cmd_parts.extend(["-s", source_ip])
+        if destination_ip: base_cmd_parts.extend(["-d", destination_ip])
 
-        # --- Generate specific command(s) based on service ---
         commands_for_this_rule = []
-
         if service_name in SERVICES_TO_IGNORE:
-            # Generate single command without service specifics
             cmd_parts = base_cmd_parts + ["-j", iptables_target]
             commands_for_this_rule.append(" ".join(cmd_parts))
-            log.debug(f"[ENGINE] Generated IP-only command for service '{service_name}'")
         else:
             param_list = service_mapper.get_service_params(service_name)
             if param_list:
-                log.debug(f"[ENGINE] Generating {len(param_list)} specific command(s) for service '{service_name}'")
                 for param_dict in param_list:
-                    cmd_parts = list(base_cmd_parts) # Start with base parts
+                    cmd_parts = list(base_cmd_parts)
                     proto = param_dict.get("proto")
                     dport = param_dict.get("dport")
-                    # Add protocol if specified
                     if proto:
                         cmd_parts.extend(["-p", proto])
-                        # Add dport only if relevant proto and dport exists
                         if proto in ["tcp", "udp"] and dport is not None:
                             cmd_parts.extend(["--dport", str(dport)])
                         elif dport is not None:
-                            log.warning(f"[ENGINE] Dport ({dport}) specified for non-TCP/UDP proto '{proto}' in service '{service_name}'. Ignoring dport.")
-                    # Final target action
+                            log.warning(
+                                f"[ENGINE] Dport for non-TCP/UDP proto '{proto}' in '{service_name}'. Ignoring dport.")
                     cmd_parts.extend(["-j", iptables_target])
                     commands_for_this_rule.append(" ".join(cmd_parts))
             else:
-                 # Service not found/defined, generate IP-only rule
-                 log.warning(f"[ENGINE] Service '{service_name}' not found/defined. Generating IP-only command.")
-                 cmd_parts = base_cmd_parts + ["-j", iptables_target]
-                 commands_for_this_rule.append(" ".join(cmd_parts))
+                log.warning(f"[ENGINE] Service '{service_name}' not found/defined. IP-only command.")
+                cmd_parts = base_cmd_parts + ["-j", iptables_target]
+                commands_for_this_rule.append(" ".join(cmd_parts))
 
-        # --- Store the result for this rule ---
         if commands_for_this_rule:
-            log.debug(f"[ENGINE] For Rule {i+1}, generated {len(commands_for_this_rule)} command(s) targeting device {target_device_ip}.")
-            # Add tuple: (target_device, source, destination, command_list)
+            log.debug(
+                f"[ENGINE] For Rule {i + 1}, generated {len(commands_for_this_rule)} cmd(s) target: {final_target_device_ip}, src: {source_ip}, dest: {destination_ip}")
             all_generated_commands.append(
-                (target_device_ip, source_ip, destination_ip, commands_for_this_rule)
+                (final_target_device_ip, source_ip, destination_ip, commands_for_this_rule)
             )
         else:
-             log.warning(f"[ENGINE] No commands were generated for rule {i+1}.")
-
+            log.warning(f"[ENGINE] No commands were generated for rule {i + 1}.")
     return all_generated_commands
 
 
-def process_and_dispatch(nl_text: str):
-    """
-    Parses, generates, and immediately dispatches commands.
-    NOTE: Uses the new parse_and_generate_commands structure.
-    """
-    log.info(f"[ENGINE] Processing and dispatching: '{nl_text}'")
-    generated_tuples = parse_and_generate_commands(nl_text)
-
+def process_and_dispatch(nl_text: str, preferred_target_ip: str | None = None):  # Add arg
+    log.info(f"[ENGINE] Processing and dispatching: '{nl_text}', Preferred Target: {preferred_target_ip}")
+    generated_tuples = parse_and_generate_commands(nl_text, preferred_target_ip)  # Pass arg
     if not generated_tuples:
         log.warning("[ENGINE] No commands generated, nothing to dispatch.")
         return
 
     total_sent = 0
     for target_ip, src_ip, dest_ip, cmd_list in generated_tuples:
-        log.info(f"[DISPATCH] Sending {len(cmd_list)} command(s) to target {target_ip} (Rule context: src={src_ip}, dest={dest_ip})")
+        log.info(
+            f"[DISPATCH] Sending {len(cmd_list)} cmd(s) to target {target_ip} (Rule: src={src_ip}, dest={dest_ip})")
         for cmd in cmd_list:
             try:
-                admin_connect.send_command(target_ip, cmd)
-                total_sent += 1
+                if admin_connect and hasattr(admin_connect, 'send_command'):
+                    admin_connect.send_command(target_ip, cmd)
+                    total_sent += 1
+                else:
+                    log.error("[DISPATCH] admin_connect unavailable.")
+                    break
             except ConnectionError as e:
-                log.error(f"[DISPATCH] Failed to send command to {target_ip}: {e}")
-                # Stop sending remaining commands for this target if one fails?
+                log.error(f"[DISPATCH] Failed to send to {target_ip}: {e}")
                 break
             except Exception as e:
-                 log.error(f"[DISPATCH] Unexpected error sending command to {target_ip}: {e}")
-                 break # Stop on unexpected errors too
+                log.error(f"[DISPATCH] Unexpected error sending to {target_ip}: {e}")
+                break
     log.info(f"[DISPATCH] Finished. Total commands sent: {total_sent}")
 
 
-# Example usage
 if __name__ == "__main__":
-    # Set logging level for testing
     logging.getLogger('policy_engine').setLevel(logging.DEBUG)
-    logging.getLogger('nlp').setLevel(logging.DEBUG)
-    logging.getLogger('service_mapper').setLevel(logging.INFO) # Keep mapper info level
+    logging.getLogger('nlp').setLevel(logging.DEBUG)  # Keep NLP debug for now
+    logging.getLogger('service_mapper').setLevel(logging.INFO)
 
-    test_nl = "deny ssh from 192.168.1.12 to 192.168.1.11. allow http from 10.0.0.5 to 192.168.1.11. on 10.0.0.1 block dns from 10.0.0.50."
+    # Test case 1: NLP defaults target, GUI overrides
+    test_nl1 = "deny 192.168.1.12"  # NLP target will be 1.12
+    preferred1 = "192.168.1.11"  # GUI selected this
+    print(f"\n--- Test 1: '{test_nl1}' with Preferred Target '{preferred1}' ---")
+    commands1 = parse_and_generate_commands(test_nl1, preferred_target_ip=preferred1)
+    for t_ip, s_ip, d_ip, c_list in commands1: print(f"  Target: {t_ip}, Src: {s_ip}, Dest: {d_ip}, Cmds: {c_list}")
 
-    print("\n--- Testing parse_and_generate_commands ---")
-    commands = parse_and_generate_commands(test_nl)
-    print("\n--- Generated Command Tuples ---")
-    if commands:
-        for t in commands:
-            print(f"  Target: {t[0]}, Source: {t[1]}, Dest: {t[2]}")
-            for cmd in t[3]:
-                print(f"    - {cmd}")
-    else:
-        print("  No commands generated.")
-    print("-" * 30)
+    # Test case 2: NLP is explicit, GUI selection ignored
+    test_nl2 = "on 192.168.1.50 allow ssh from 192.168.1.60"  # NLP target is 1.50
+    preferred2 = "192.168.1.11"  # GUI selected this
+    print(
+        f"\n--- Test 2: '{test_nl2}' with Preferred Target '{preferred2}' (should be ignored by engine if NLP explicit) ---")
+    commands2 = parse_and_generate_commands(test_nl2, preferred_target_ip=preferred2)
+    for t_ip, s_ip, d_ip, c_list in commands2: print(f"  Target: {t_ip}, Src: {s_ip}, Dest: {d_ip}, Cmds: {c_list}")
 
-    # Simulate connected clients if needed for process_and_dispatch test
-    # print("\n--- Testing process_and_dispatch ---")
-    # if not admin_connect.clients:
-    #     print("[ENGINE TEST SETUP] Simulating connected clients for dispatch test.")
-    #     admin_connect.clients = {ip: object() for ip in ['192.168.1.11', '10.0.0.1', '10.0.0.50']}
-    # process_and_dispatch(test_nl)
-    # print("-" * 30)
+    # Test case 3: NLP defaults target (dest), GUI overrides
+    test_nl3 = "allow http to 192.168.1.70"  # NLP target will be 1.70
+    preferred3 = "192.168.1.11"
+    print(f"\n--- Test 3: '{test_nl3}' with Preferred Target '{preferred3}' ---")
+    commands3 = parse_and_generate_commands(test_nl3, preferred_target_ip=preferred3)
+    for t_ip, s_ip, d_ip, c_list in commands3: print(f"  Target: {t_ip}, Src: {s_ip}, Dest: {d_ip}, Cmds: {c_list}")
+
+    # Test case 4: Two IPs, NLP defaults target (dest), GUI overrides
+    test_nl4 = "block dns from 192.168.1.80 to 192.168.1.90"  # NLP target will be 1.90
+    preferred4 = "192.168.1.11"
+    print(f"\n--- Test 4: '{test_nl4}' with Preferred Target '{preferred4}' ---")
+    commands4 = parse_and_generate_commands(test_nl4, preferred_target_ip=preferred4)
+    for t_ip, s_ip, d_ip, c_list in commands4: print(f"  Target: {t_ip}, Src: {s_ip}, Dest: {d_ip}, Cmds: {c_list}")
+
+    # Test Case 5: Multi-sentence, one with implicit target, one explicit
+    test_nl5 = "deny 192.168.1.20. on 192.168.1.21 allow 192.168.1.22"
+    preferred5 = "192.168.1.100"
+    print(f"\n--- Test 5: '{test_nl5}' with Preferred Target '{preferred5}' ---")
+    commands5 = parse_and_generate_commands(test_nl5, preferred_target_ip=preferred5)
+    print("Expected: Rule 1 Target=100 (override), Rule 2 Target=21 (explicit)")
+    for t_ip, s_ip, d_ip, c_list in commands5: print(f"  Target: {t_ip}, Src: {s_ip}, Dest: {d_ip}, Cmds: {c_list}")

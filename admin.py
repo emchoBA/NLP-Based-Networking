@@ -481,31 +481,58 @@ class AdminGUI(QMainWindow):
         if self._is_closing: return
         nl_command = self.nl_input.text().strip()
         if not nl_command: QMessageBox.warning(self, "Input Error", "Please enter policy command."); return
-        self.append_log(f"[GUI] Preview requested for: '{nl_command}'")
-        self.clear_preview(); self.preview_area.setPlaceholderText("Generating preview...")
-        QApplication.processEvents()
+
+        # --- GET PREFERRED TARGET FROM GUI SELECTION ---
+        # _selected_target_actual_ip stores the IP even if display is alias
+        preferred_target_for_engine = self._selected_target_actual_ip
+        self.append_log(
+            f"[GUI] Preview requested for: '{nl_command}'. GUI Selected Actual IP (Preferred Target): {preferred_target_for_engine}")
+        # --- END GET PREFERRED TARGET ---
+
+        self.clear_preview();
+        self.preview_area.setPlaceholderText("Generating preview...")
+        QApplication.processEvents()  # Allow GUI to update
         try:
-            generated_tuples = policy_engine.parse_and_generate_commands(nl_command)
+            # --- PASS PREFERRED TARGET TO ENGINE ---
+            generated_tuples = policy_engine.parse_and_generate_commands(nl_command,
+                                                                         preferred_target_ip=preferred_target_for_engine)
+            # --- END PASS PREFERRED TARGET ---
+
             if not generated_tuples:
-                self.preview_area.setPlaceholderText("No valid commands generated."); self.preview_area.clear()
-                QMessageBox.information(self, "Preview", "Could not generate commands."); return
-            self._previewed_commands = generated_tuples
+                self.preview_area.setPlaceholderText("No valid commands generated or rule structure not understood.")
+                self.preview_area.clear()  # Explicitly clear if no commands
+                QMessageBox.information(self, "Preview", "Could not generate commands from the input.")
+                return
+
+            self._previewed_commands = generated_tuples  # Store for sending
             preview_text = ""
-            for i, (target_ip, src_ip, dest_ip, cmd_list) in enumerate(generated_tuples):
-                 context = []
-                 if src_ip: context.append(f"Src: {alias_manager.get_alias_for_ip(src_ip) or src_ip}")
-                 if dest_ip: context.append(f"Dest: {alias_manager.get_alias_for_ip(dest_ip) or dest_ip}")
-                 target_display = alias_manager.get_alias_for_ip(target_ip) or target_ip
-                 context_str = ", ".join(context) if context else "General Rule"
-                 preview_text += f"--- Rule {i+1} ({context_str} -> Target: {target_display} [{target_ip}]) ---\n"
-                 for cmd in cmd_list: preview_text += f"  {cmd}\n"
-                 preview_text += "\n"
+            for i, (target_ip, source_ip, dest_ip, cmd_list) in enumerate(generated_tuples):
+                context = []
+                # Ensure alias_manager is available before calling its methods
+                alias_fn = alias_manager.get_alias_for_ip if alias_manager else lambda x: None
+
+                if source_ip: context.append(f"Src: {alias_fn(source_ip) or source_ip}")
+                if dest_ip: context.append(f"Dest: {alias_fn(dest_ip) or dest_ip}")
+                target_display = alias_fn(target_ip) or target_ip
+                context_str = ", ".join(context) if context else "General Rule"
+                preview_text += f"--- Rule {i + 1} ({context_str} -> Target: {target_display} [{target_ip}]) ---\n"
+
+                if not cmd_list:
+                    preview_text += "  (No specific commands generated for this rule)\n"
+                for cmd in cmd_list:
+                    preview_text += f"  {cmd}\n"
+                preview_text += "\n"
+
             self.preview_area.setPlainText(preview_text.strip())
-            self.send_btn.setEnabled(True)
+            self.send_btn.setEnabled(True)  # Enable sending only if preview succeeded
+
         except Exception as e:
             self.append_log(f"[GUI ERROR] Policy preview failed: {e}")
-            logging.exception("Policy preview failed"); self.preview_area.setPlaceholderText("Error during preview.")
-            QMessageBox.critical(self, "Preview Error", f"Failed to generate commands:\n{e}"); self.clear_preview()
+            logging.exception("Policy preview failed")  # Log traceback
+            self.preview_area.setPlaceholderText("Error during preview. Check logs.")
+            self.preview_area.clear()
+            QMessageBox.critical(self, "Preview Error", f"Failed to parse or generate commands:\n{e}")
+            self.clear_preview()
 
     def send_policy(self):
         if not admin_connect: QMessageBox.critical(self, "Module Error", "admin_connect not loaded."); return
