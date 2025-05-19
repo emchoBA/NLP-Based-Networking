@@ -85,180 +85,226 @@ def preprocess_and_resolve_aliases(text: str) -> str:
     return " ".join(processed_text.split()) # Final space normalization
 
 
+# In nlp.py, replace your ENTIRE existing parse_single function with this:
+
 def parse_single(cmd: str) -> dict:
     """
-    Parse one clause AFTER aliases have been resolved in the input string.
+    Parse one clause AFTER aliases have been resolved.
+    Attempts to handle action verbs appearing late in the sentence and
+    improves service identification around common words.
     """
-    # 'cmd' here is assumed to be a single sentence string, already preprocessed
-    # and with aliases resolved to IPs by the calling function (parse_commands).
     doc = nlp(cmd)
-
-    log.debug(
-        f"[NLP parse_single] Input to parse_single (after alias resolution and sentence split): '{cmd}'")  # Log input
+    log.debug(f"[NLP parse_single] Input: '{cmd}'")
 
     result = {
         "action": None, "service": None,
         "source_ip": None, "destination_ip": None,
         "target_device_ip": None,
     }
-    action_idx = -1
-    for i, tok in enumerate(doc):
-        lem = tok.lemma_.lower()
-        if lem in ACTION_VERBS:
-            result["action"] = lem
-            action_idx = i
-            break
 
-    # 2) SERVICE: Find the first relevant noun after the action (if action exists)
-    if action_idx != -1:
+    # --- Pass 1: Identify all potential action verbs and their positions ---
+    potential_actions = []
+    for i, token in enumerate(doc):
+        if token.lemma_.lower() in ACTION_VERBS:
+            potential_actions.append({"token": token, "index": i, "lemma": token.lemma_.lower()})
+
+    if not potential_actions:
+        log.warning(f"[NLP parse_single] No action verb found in '{cmd}'.")
+        return {}
+
+    # --- Heuristic: Choose the LAST action verb found as the primary action ---
+    chosen_action_info = potential_actions[-1]
+    result["action"] = chosen_action_info["lemma"]
+    action_idx = chosen_action_info["index"]
+    log.debug(
+        f"[NLP parse_single] Chosen action: '{result['action']}' (original text: '{chosen_action_info['token'].text}') at index {action_idx}")
+
+    # --- Service Identification (Revised Again) ---
+    service_found_flag = False
+    result["service"] = None  # Explicitly reset before search
+
+    # Attempt 1: Look for service AFTER the chosen action
+    if action_idx + 1 < len(doc):
         log.debug(
-            f"[NLP parse_single] Searching for service after action '{result['action']}' in: '{doc[action_idx + 1:].text}'")
-        service_found_flag = False  # Flag to see if we ever assign it
+            f"[NLP parse_single] Attempt 1: Searching service AFTER action '{result['action']}' in: '{doc[action_idx + 1:].text}'")
+        # List of common non-service words that might appear before the actual service name
+        skippable_service_prefix_words = {"all", "any", "incoming", "outgoing", "traffic", "access", "queries"}
+
+        temp_service_candidate_after = None
         for i, tok in enumerate(doc[action_idx + 1:]):
-            actual_token_index_in_doc = action_idx + 1 + i  # Index in the full 'doc'
+            actual_token_index_in_doc = action_idx + 1 + i
+            if actual_token_index_in_doc >= len(doc): break
 
-            # Ensure we don't go out of bounds if action_idx was the last token (unlikely but safe)
-            if actual_token_index_in_doc >= len(doc):
-                break
-
-            log.debug(
-                f"[NLP parse_single] Service check: token='{tok.text}', lemma='{tok.lemma_}', is_alpha={tok.is_alpha}, is_stop={tok.is_stop}, is_punct={tok.is_punct}")
-
+            log.debug(f"[NLP parse_single] Service check (after action): token='{tok.text}', lemma='{tok.lemma_}'...")
             if tok.is_stop or tok.is_punct:
                 log.debug(f"[NLP parse_single] Skipping token '{tok.text}' (stop/punct).")
                 continue
 
             tl = tok.lemma_.lower()
-
-            # Check if the current token starts an IP address (more robust boundary)
-            # This means if we see "allow 192.168.1.10 ..." it won't mistake 192 for service
-            is_ip_check_span = doc[actual_token_index_in_doc: actual_token_index_in_doc + 1]
-            if ip_matcher(is_ip_check_span):  # Check if the token itself is an IP
-                log.debug(f"[NLP parse_single] Token '{tok.text}' is an IP. Stopping service search.")
+            # Check for IP or boundary preposition to stop search
+            if ip_matcher(doc[actual_token_index_in_doc: actual_token_index_in_doc + 1]):
+                log.debug(f"[NLP parse_single] Token '{tok.text}' is an IP. Stopping service search (after action).")
                 break
-
-            if tl in BOUNDARY_PREPS:  # Stop if we hit any IP-related preposition
+            if tl in BOUNDARY_PREPS:
                 log.debug(
-                    f"[NLP parse_single] Token '{tok.text}' (lemma '{tl}') is a boundary preposition. Stopping service search.")
+                    f"[NLP parse_single] Token '{tok.text}' is a boundary preposition. Stopping service search (after action).")
                 break
 
-            if tok.is_alpha:  # Must be alphabetic
-                result["service"] = tl
-                service_found_flag = True  # Mark service as found
-                log.debug(f"[NLP parse_single] Service FOUND: '{result['service']}' from token '{tok.text}'")
-                break  # Found the service
+            if tok.is_alpha:  # Using is_alpha as per your base for service candidate
+                if tl in skippable_service_prefix_words and temp_service_candidate_after is None:
+                    # It's a skippable word, and we haven't found a better candidate yet from this direction.
+                    # We note it but continue, hoping a more specific service follows.
+                    log.debug(f"[NLP parse_single] Token '{tok.text}' is a skippable prefix. Continuing search...")
+                    # We could store this as a very weak candidate if nothing better is found
+                    # temp_service_candidate_after = tl # Option: store it weakly
+                    continue
+                else:
+                    # This is either a non-skippable alpha word, or a skippable one appearing after another candidate
+                    # (which shouldn't happen with current logic if we break on first non-skippable).
+                    # We take this as the service.
+                    temp_service_candidate_after = tl
+                    log.debug(
+                        f"[NLP parse_single] Strong service candidate (after action): '{temp_service_candidate_after}' from token '{tok.text}'")
+                    break  # Found a strong potential service (or a non-skippable word)
             else:
-                # If it's not alpha, not stop/punct, not an IP, and not a boundary, stop.
-                # This could be a number or other symbol that shouldn't be a service.
                 log.debug(
-                    f"[NLP parse_single] Token '{tok.text}' is not alpha (and not other known category). Stopping service search here.")
+                    f"[NLP parse_single] Token '{tok.text}' is not alpha. Stopping service search (after action).")
                 break
 
-        if not service_found_flag:
-            log.debug(
-                f"[NLP parse_single] No specific service found after action. Defaulting to 'any' if needed later.")
-            # Defaulting to 'any' now happens at the end of parse_single if service is still None
+        if temp_service_candidate_after:
+            result["service"] = temp_service_candidate_after
+            service_found_flag = True
+            log.debug(f"[NLP parse_single] Final service from Attempt 1 (after action): '{result['service']}'")
 
-    # 3) IPs: Find all IP addresses and try to determine their roles
+    # Attempt 2: If no specific service found AFTER action, look BEFORE the chosen action
+    if not service_found_flag and action_idx > 0:
+        log.debug(
+            f"[NLP parse_single] Attempt 2: No specific service after action. Searching service BEFORE action '{result['action']}' in: '{doc[:action_idx].text}'")
+
+        # Heuristic: iterate backwards, take first non-skippable alpha token.
+        # Skippable words should ideally be known general terms or configurable.
+        skippable_service_general_words = {"all", "any", "incoming", "outgoing", "traffic", "access", "queries",
+                                           "ensure", "please"}  # Add more as needed
+
+        temp_service_candidate_before = None
+        for i in range(action_idx - 1, -1, -1):
+            tok = doc[i]
+            log.debug(f"[NLP parse_single] Service check (before action): token='{tok.text}', lemma='{tok.lemma_}'...")
+            if tok.is_stop or tok.is_punct: continue
+
+            tl = tok.lemma_.lower()
+            # Don't pick up parts of "on DeviceX" or other prepositions as service
+            if ip_matcher(doc[i:i + 1]): continue
+            if tl in BOUNDARY_PREPS: continue
+            if tl in TARGET_DEVICE_PREPS: continue  # Also skip "on", "at" themselves
+
+            if tok.is_alpha:
+                # If it's not a generally skippable word, consider it strong.
+                if tl not in skippable_service_general_words:
+                    temp_service_candidate_before = tl
+                    log.debug(
+                        f"[NLP parse_single] Strong service candidate (before action): '{temp_service_candidate_before}' from token '{tok.text}'")
+                    break  # Found strong candidate
+                elif temp_service_candidate_before is None:  # First skippable word encountered
+                    temp_service_candidate_before = tl  # Weak candidate
+
+        if temp_service_candidate_before:
+            result["service"] = temp_service_candidate_before
+            service_found_flag = True
+            log.debug(f"[NLP parse_single] Final service from Attempt 2 (before action): '{result['service']}'")
+
+    if not service_found_flag:
+        log.debug(f"[NLP parse_single] No specific service identified by either attempt.")
+
+    # --- IP Identification and Role Assignment (from your working version) ---
     ip_matches_found = []
-    for match_id, start, end in ip_matcher(doc):  # Use ip_matcher here
+    for match_id, start, end in ip_matcher(doc):
         ip_text = doc[start:end].text
         preceding_token_lemma = doc[start - 1].lemma_.lower() if start > 0 else None
-        ip_matches_found.append({
-            "ip": ip_text,
-            "prep": preceding_token_lemma,
-            "start_index": start
-        })
-
+        ip_matches_found.append({"ip": ip_text, "prep": preceding_token_lemma, "start_index": start})
     log.debug(f"[NLP parse_single] IP matches in '{doc.text}': {ip_matches_found}")
 
-    target_assigned_explicitly = False
-    source_assigned = False
+    target_assigned_explicitly = False;
+    source_assigned = False;
     destination_assigned = False
     remaining_matches = list(ip_matches_found)
 
-    # Priority 1: Explicit Target Device ("on"/"at")
     temp_remaining_target = []
     for match in remaining_matches:
         if match["prep"] in TARGET_DEVICE_PREPS:
             if not result["target_device_ip"]:
-                result["target_device_ip"] = match["ip"]
+                result["target_device_ip"] = match["ip"];
                 target_assigned_explicitly = True
-                log.debug(f"[NLP parse_single] Explicit Target IP: {match['ip']} (from '{match['prep']}')")
+                log.debug(f"[NLP parse_single] Explicit Target IP: {match['ip']}")
             else:
-                log.warning(
-                    f"[NLP parse_single] Multiple 'on/at' IPs. Using first: {result['target_device_ip']}. Ignoring: {match['ip']}")
+                log.warning(f"[NLP parse_single] Multiple 'on/at' IPs. Using first: {result['target_device_ip']}.")
                 temp_remaining_target.append(match)
         else:
             temp_remaining_target.append(match)
     remaining_matches = temp_remaining_target
 
-    # Priority 2: Source IP ("from")
     temp_remaining_source = []
     for match in remaining_matches:
         if match["prep"] in SOURCE_IP_PREPS:
             if not result["source_ip"]:
-                result["source_ip"] = match["ip"]
+                result["source_ip"] = match["ip"];
                 source_assigned = True
-                log.debug(f"[NLP parse_single] Source IP: {match['ip']} (from '{match['prep']}')")
+                log.debug(f"[NLP parse_single] Source IP: {match['ip']}")
             else:
-                log.warning(
-                    f"[NLP parse_single] Multiple 'from' IPs. Using first: {result['source_ip']}. Ignoring: {match['ip']}")
+                log.warning(f"[NLP parse_single] Multiple 'from' IPs. Using first.")
         else:
             temp_remaining_source.append(match)
     remaining_matches = temp_remaining_source
 
-    # Priority 3: Destination IP ("to")
     temp_remaining_dest = []
     for match in remaining_matches:
         if match["prep"] in DESTINATION_IP_PREPS:
             if not result["destination_ip"]:
-                result["destination_ip"] = match["ip"]
+                result["destination_ip"] = match["ip"];
                 destination_assigned = True
-                log.debug(f"[NLP parse_single] Destination IP: {match['ip']} (from '{match['prep']}')")
+                log.debug(f"[NLP parse_single] Destination IP: {match['ip']}")
             else:
-                log.warning(
-                    f"[NLP parse_single] Multiple 'to' IPs. Using first: {result['destination_ip']}. Ignoring: {match['ip']}")
+                log.warning(f"[NLP parse_single] Multiple 'to' IPs. Using first.")
         else:
             temp_remaining_dest.append(match)
     remaining_matches = temp_remaining_dest
 
-    # Priority 4: Unassigned IP (Default single remaining IP to Source)
     if len(remaining_matches) == 1 and not source_assigned and not destination_assigned:
-        match = remaining_matches[0]
-        result["source_ip"] = match["ip"]
-        source_assigned = True  # Mark as assigned
-        log.debug(f"[NLP parse_single] Defaulted remaining IP as Source IP: {match['ip']}")
-        remaining_matches.pop(0)
+        # Check if this IP was already used as an explicit target
+        # This check is important if the explicit target itself didn't have a prep like "on" before it
+        # which is less likely with current IP/Alias resolution but good for robustness.
+        match_ip = remaining_matches[0]["ip"]
+        if not (target_assigned_explicitly and result["target_device_ip"] == match_ip):
+            result["source_ip"] = match_ip;
+            source_assigned = True
+            log.debug(f"[NLP parse_single] Defaulted remaining IP as Source: {match_ip}")
+            remaining_matches.pop(0)  # Consume it
 
     if remaining_matches:
-        log.warning(
-            f"[NLP parse_single] Unassigned IPs after all assignments in '{doc.text}': {[m['ip'] for m in remaining_matches]}")
+        # Filter out IPs already assigned to ensure warning is for truly unassigned ones
+        unassigned_ips_final = []
+        assigned_ips = {result["target_device_ip"], result["source_ip"], result["destination_ip"]}
+        for m in remaining_matches:
+            if m["ip"] not in assigned_ips:
+                unassigned_ips_final.append(m["ip"])
+        if unassigned_ips_final:
+            log.warning(f"[NLP parse_single] Unassigned IPs at end: {unassigned_ips_final}")
 
-    # --- Determine Final Target Device IP ---
     if not target_assigned_explicitly:
-        if destination_assigned:
+        if destination_assigned and result["destination_ip"]:
             result["target_device_ip"] = result["destination_ip"]
-            log.debug(f"[NLP parse_single] Implicit Target IP set to Destination IP: {result['target_device_ip']}")
-        elif source_assigned:
+        elif source_assigned and result["source_ip"]:
             result["target_device_ip"] = result["source_ip"]
-            log.debug(f"[NLP parse_single] Implicit Target IP set to Source IP: {result['target_device_ip']}")
 
-    # --- Final Validation ---
-    if not result["action"]:
-        log.warning(f"[NLP parse_single] Validation failed for '{doc.text}': No action. Result: {result}")
-        return {}
-    if not result["target_device_ip"]:
-        log.warning(f"[NLP parse_single] Validation failed for '{doc.text}': No target device. Result: {result}")
-        return {}
-    if not result["source_ip"] and not result["destination_ip"]:
-        log.warning(f"[NLP parse_single] Validation failed for '{doc.text}': No source or dest IP. Result: {result}")
-        return {}
+    # --- Final Validation & Defaulting Service ---
+    if not result["action"] or not result["target_device_ip"] or not (result["source_ip"] or result["destination_ip"]):
+        log.warning(
+            f"[NLP parse_single] Validation failed for '{doc.text}'. Missing core component(s). Result: {result}")
+        return {}  # Return empty if core components are missing
 
-    # If service wasn't found, default it
-    if result["action"] and not result["service"]:
+    if not result["service"]:  # If still no service after both attempts
         result["service"] = "any"
-        log.debug(f"[NLP parse_single] Service defaulted to 'any' for action '{result['action']}'")
+        log.debug(f"[NLP parse_single] Service defaulted to 'any' for action '{result['action']}' at the end")
 
     log.info(f"[NLP parse_single] Final Parsed Result for '{doc.text}': {result}")
     return result
