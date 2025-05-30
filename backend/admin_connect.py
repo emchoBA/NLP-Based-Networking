@@ -1,5 +1,3 @@
-# admin_connect.py
-
 #!/usr/bin/env python3
 """
 admin_connect.py
